@@ -16,7 +16,7 @@ securelink/
 │   └── securelink_fraud_pipeline.py
 ├── dashboard/
 │   └── app.py
-├── data/               ← ACÁ VAN TUS CSVs
+├── data/
 │   ├── transactions_data.csv
 │   ├── users_data.csv
 │   ├── cards_data.csv
@@ -115,13 +115,6 @@ El archivo `transactions_data.csv` pesa 1.2 GB. El pipeline lo lee en bloques
 de 100.000 filas para no quedarse sin memoria. Esto es lo correcto para
 datasets grandes, pero lleva su tiempo.
 
-Si querés probar más rápido, podés hacer una muestra del archivo:
-```python
-import pandas as pd
-df = pd.read_csv("data/transactions_data.csv", nrows=500_000)
-df.to_csv("data/transactions_data.csv", index=False)
-```
-(Ojo: esto sobreescribe el archivo original. Hacé una copia antes.)
 
 ---
 
