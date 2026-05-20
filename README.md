@@ -6,7 +6,78 @@ El proyecto sigue el **framework de 8 pasos** visto en clase (material 7.1 – F
 
 ---
 
+## Primera ejecución (setup inicial)
+
+Si nunca corriste el proyecto, seguí estos pasos en orden. Si ya tenés todo levantado y solo querés volver a arrancar, saltá a [Inicio rápido](#inicio-rápido).
+
+### 1. Requisitos previos
+
+- **Docker Desktop** instalado y corriendo. Descarga: https://www.docker.com/products/docker-desktop/
+- ~5 GB libres en disco (imágenes Docker + 1.4 GB de datos crudos + ~3 GB del DWH una vez cargado).
+- Puertos `8080`, `8501` y `5433` libres en `localhost`.
+- Recomendado: dar al menos **4 GB de RAM** a Docker Desktop (Settings → Resources).
+
+### 2. Obtener los archivos de datos
+
+Los 5 archivos de entrada (~1.4 GB en total) **no están en Git** porque GitHub limita archivos a 100 MB. Pedíselos a algún integrante del equipo (Drive, OneDrive, USB, etc.) y ponelos en `./data/` con estos nombres exactos:
+
+```
+data/
+├── transactions_data.csv      (~1.2 GB)
+├── train_fraud_labels.json    (~152 MB)
+├── users_data.csv             (~161 KB)
+├── cards_data.csv             (~498 KB)
+└── mcc_codes.json             (~4.7 KB)
+```
+
+Sin estos archivos el pipeline (flujo de procesamiento) falla en la primera tarea (`validate_files`).
+
+### 3. Levantar los contenedores
+
+```bash
+docker compose up -d --build
+```
+
+La primera vez baja imágenes y construye (~5–10 min). Las siguientes son segundos. Verificá con:
+
+```bash
+docker compose ps
+```
+
+Tienen que aparecer los 5 servicios en estado `Up`: `postgres-airflow`, `postgres-dwh`, `airflow-init`, `airflow-scheduler`, `airflow-webserver`, `securelink-dashboard`.
+
+### 4. Correr el pipeline por primera vez
+
+El DWH (Data Warehouse / almacén de datos) arranca **vacío** — sin este paso el dashboard muestra "No hay datos aún".
+
+1. Abrir http://localhost:8080 (usuario `admin`, contraseña `admin`).
+2. En la lista de DAGs, despausar `securelink_fraud_pipeline` (toggle a la izquierda).
+3. Click en ▶️ **Trigger DAG**.
+4. Esperar **10–15 minutos**. Podés ver el progreso en la vista Graph (click en el DAG → Graph).
+5. Cuando todas las tareas están en verde (`success`), el DWH ya tiene los datos.
+
+### 5. Verificar que el dashboard funciona
+
+Abrir http://localhost:8501. Deberías ver:
+- KPIs con ~13 millones de transacciones procesadas.
+- Métricas de fraude (tasa, monto en riesgo, FP / FN).
+- Las pestañas del Panel General con gráficos poblados.
+
+### Troubleshooting (qué hacer si algo falla)
+
+| Síntoma | Causa probable | Solución |
+|---|---|---|
+| Contenedores reiniciando o muriendo | Docker sin recursos suficientes | Subir RAM en Docker Desktop (Settings → Resources, mínimo 4 GB). |
+| El DAG falla en `validate_files` | Faltan archivos en `./data/` o nombres mal escritos | Verificar que estén los 5 archivos con el nombre exacto (paso 2). |
+| Dashboard dice "No hay datos aún" | El pipeline no se ejecutó o falló | Revisar logs en Airflow (click en la tarea roja → Logs). |
+| Puerto 8080 / 8501 / 5433 ocupado | Otro proceso lo está usando | `docker compose down` y matar el otro proceso, o cambiar el puerto en `docker-compose.yml`. |
+| Quiero borrar todo y empezar de cero | — | `docker compose down -v` (el `-v` borra también los volúmenes y los datos del DWH — vas a tener que reejecutar el DAG). |
+
+---
+
 ## Inicio rápido
+
+Si ya hiciste el [setup inicial](#primera-ejecución-setup-inicial) al menos una vez, alcanza con:
 
 ```bash
 docker compose up -d --build
@@ -18,7 +89,7 @@ docker compose up -d --build
 | Streamlit Dashboard | http://localhost:8501 | sin auth |
 | PostgreSQL DWH | localhost:5433 | `dwh` / `dwh123` |
 
-Una vez levantado, activar el DAG `securelink_fraud_pipeline` en Airflow y ejecutarlo manualmente (▶ Trigger DAG). El pipeline procesa ~13 M transacciones; en una notebook tarda aproximadamente 10–15 min.
+Si el DWH conserva los datos de una corrida anterior (volumen no borrado), el dashboard funciona de una. Si está vacío, repetir el paso 4 del setup (activar y disparar el DAG).
 
 ---
 
