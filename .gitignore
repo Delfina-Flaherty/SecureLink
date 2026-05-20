@@ -3,3 +3,9 @@ data/
 __pycache__/
 *.pyc
 *.log
+
+# Material del curso (PDFs, plantillas, ejemplos)
+extra/
+
+# Configuración local de Claude Code
+.claude/
