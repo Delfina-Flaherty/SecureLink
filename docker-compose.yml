@@ -37,7 +37,7 @@ services:
       - postgres_dwh_data:/var/lib/postgresql/data
       - ./init_sql/init_dwh.sql:/docker-entrypoint-initdb.d/01_init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dwh"]
+      test: ["CMD-SHELL", "pg_isready -U dwh -d securelink"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -121,6 +121,10 @@ services:
       - AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL=30
       - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth
       - AIRFLOW_CONN_POSTGRES_DWH=postgres://dwh:dwh123@postgres-dwh:5432/securelink
+      - AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT=300
+      - AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT=300
+      - AIRFLOW__WEBSERVER__WORKERS=1
+      - AIRFLOW__WEBSERVER__WORKER_CLASS=gevent
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs

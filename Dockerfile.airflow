@@ -14,4 +14,5 @@ RUN pip install --no-cache-dir --constraint "${AIRFLOW_CONSTRAINTS_URL}" \
     requests==2.31.0 \
     python-dateutil==2.8.2 \
     "pandas>=2.0,<3" \
-    "openpyxl>=3.1,<4"
+    "openpyxl>=3.1,<4" \
+    gevent==23.9.1

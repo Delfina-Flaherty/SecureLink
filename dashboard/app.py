@@ -286,8 +286,11 @@ if pagina == "Panel General":
         metricas = query("SELECT * FROM fraud_metrics_global ORDER BY computed_at DESC LIMIT 1")
         if metricas is None or metricas.empty:
             st.warning(
-                "⚠️ No hay datos aún. Primero hay que correr el pipeline (flujo de procesamiento) en Airflow "
-                "(http://localhost:8080 → DAG securelink_fraud_pipeline → ▶️ Trigger DAG)."
+                "⚠️ No hay datos aún. Hay que correr el pipeline (flujo de procesamiento) primero. "
+                "**Opción A (UI):** abrir http://localhost:8080 → DAG `securelink_fraud_pipeline` → ▶️ Trigger DAG. "
+                "**Opción B (CLI, recomendada si tu PC tiene poca RAM):** ejecutar en una terminal "
+                "`docker exec airflow-scheduler airflow dags trigger securelink_fraud_pipeline` "
+                "(ver sección *Troubleshooting avanzado* del README si el webserver se cae)."
             )
             st.stop()
         m = metricas.iloc[0]
