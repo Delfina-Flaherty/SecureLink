@@ -15,7 +15,16 @@ Si nunca corriste el proyecto, seguí estos pasos en orden. Si ya tenés todo le
 - **Docker Desktop** instalado y corriendo. Descarga: https://www.docker.com/products/docker-desktop/
 - ~5 GB libres en disco (imágenes Docker + 1.4 GB de datos crudos + ~3 GB del DWH una vez cargado).
 - Puertos `8080`, `8501` y `5433` libres en `localhost`.
-- Recomendado: dar al menos **4 GB de RAM** a Docker Desktop (Settings → Resources).
+- **RAM mínima recomendada en la máquina host: 8 GB**. Con 6 GB o menos vas a tener problemas de memoria (ver [Troubleshooting avanzado](#troubleshooting-avanzado-problemas-de-memoria)).
+- Recomendado: dar al menos **4 GB de RAM** a Docker Desktop (Settings → Resources). En Windows con WSL2, esto se configura en `C:\Users\<TuUsuario>\.wslconfig`:
+
+  ```
+  [wsl2]
+  memory=4GB
+  swap=4GB
+  ```
+
+  Después de modificarlo, ejecutá `wsl --shutdown` en PowerShell y reiniciá Docker Desktop. El `swap` es importante: permite que el sistema use disco como memoria virtual cuando la RAM se llena, evitando que los contenedores mueran por OOM (Out Of Memory).
 
 ### 2. Obtener los archivos de datos
 
@@ -67,11 +76,100 @@ Abrir http://localhost:8501. Deberías ver:
 
 | Síntoma | Causa probable | Solución |
 |---|---|---|
-| Contenedores reiniciando o muriendo | Docker sin recursos suficientes | Subir RAM en Docker Desktop (Settings → Resources, mínimo 4 GB). |
+| Contenedores reiniciando o muriendo | Docker sin recursos suficientes | Subir RAM en Docker Desktop (Settings → Resources, mínimo 4 GB). En WSL2 editar `.wslconfig` (ver [Requisitos previos](#1-requisitos-previos)). |
 | El DAG falla en `validate_files` | Faltan archivos en `./data/` o nombres mal escritos | Verificar que estén los 5 archivos con el nombre exacto (paso 2). |
 | Dashboard dice "No hay datos aún" | El pipeline no se ejecutó o falló | Revisar logs en Airflow (click en la tarea roja → Logs). |
 | Puerto 8080 / 8501 / 5433 ocupado | Otro proceso lo está usando | `docker compose down` y matar el otro proceso, o cambiar el puerto en `docker-compose.yml`. |
 | Quiero borrar todo y empezar de cero | — | `docker compose down -v` (el `-v` borra también los volúmenes y los datos del DWH — vas a tener que reejecutar el DAG). |
+| `localhost:8080` muestra `ERR_CONNECTION_REFUSED` o `ERR_EMPTY_RESPONSE` | El webserver de Airflow se cayó por presión de memoria | Ver [Troubleshooting avanzado](#troubleshooting-avanzado-problemas-de-memoria). |
+| Logs muestran `No response from gunicorn master within X seconds` | El worker del webserver tardó demasiado o fue matado por OOM | Ver [Troubleshooting avanzado](#troubleshooting-avanzado-problemas-de-memoria). |
+| Logs muestran `Worker (pid:X) was sent SIGKILL! Perhaps out of memory?` | El kernel mató el worker por falta de RAM | Liberar memoria: apagar el scheduler mientras se usa el webserver y viceversa. |
+| `postgres-dwh` queda `unhealthy` después de reiniciar Docker | WAL recovery o health check buscando una BD inexistente | El health check ya está corregido en este proyecto (`pg_isready -U dwh -d securelink`). Si falla, esperar 1-2 min a que PostgreSQL termine la recuperación. |
+| `database "dwh" does not exist` en los logs de postgres-dwh | Health check mal configurado (versión vieja del compose) | Ya corregido. Si aparece, verificar que el `docker-compose.yml` use `pg_isready -U dwh -d securelink`. |
+| DAG runs zombies en estado "running" tras crash del scheduler | El scheduler murió en medio de una ejecución | Marcarlos como fallidos: ver [Limpiar runs zombies](#limpiar-runs-zombies) abajo. |
+
+---
+
+## Troubleshooting avanzado: problemas de memoria
+
+Este proyecto fue diseñado para correr en máquinas con ≥ 8 GB de RAM. En equipos con menos memoria (típicamente 4-6 GB físicos), Airflow webserver + scheduler + 2 Postgres + Streamlit excede la RAM disponible y el webserver se cae con errores tipo `ERR_CONNECTION_REFUSED` o gunicorn tira `No response from master`.
+
+### Configuración aplicada en este proyecto para mitigarlo
+
+- **Worker `gevent` en el webserver**: el worker `sync` por defecto forkea un proceso completo de Python por worker (~500 MB). `gevent` usa green threads dentro de un solo proceso, reduciendo el uso de memoria a ~150-200 MB. Configurado vía `AIRFLOW__WEBSERVER__WORKER_CLASS=gevent` en `docker-compose.yml` y `gevent==23.9.1` instalado en `Dockerfile.airflow`.
+- **Timeouts extendidos**: `AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT=300` y `WEB_SERVER_MASTER_TIMEOUT=300` dan 5 minutos al worker para inicializar bajo presión de memoria, en lugar de los 120 s por defecto.
+- **Health check de `postgres-dwh` corregido**: `pg_isready -U dwh -d securelink` (antes era `-U dwh` solo, que intentaba conectar a una BD inexistente).
+
+### Si aún así el webserver se cae
+
+El pipeline ya se ejecutó al menos una vez (los datos están en el DWH), seguí estos pasos:
+
+#### Opción A — Apagar el scheduler para usar el webserver
+
+Si solo necesitás ver el DAG en la UI (para entrega, screenshots, navegación), no necesitás el scheduler corriendo:
+
+```bash
+docker stop airflow-scheduler
+docker compose up -d --force-recreate airflow-webserver
+```
+
+Esperá 2-3 minutos. El webserver va a arrancar estable con toda la RAM disponible.
+
+#### Opción B — Apagar el webserver para correr el pipeline
+
+Si necesitás triggerar una nueva ejecución del DAG, apagá el webserver primero (el pipeline corre solo en el scheduler):
+
+```bash
+docker stop airflow-webserver
+# Triggerar via CLI:
+docker exec airflow-scheduler airflow dags trigger securelink_fraud_pipeline
+```
+
+Cuando termine (monitorearlo con `docker exec airflow-scheduler airflow dags list-runs -d securelink_fraud_pipeline`), volver a levantar el webserver con la Opción A.
+
+#### Opción C — Verificar resultados sin Airflow UI
+
+El dashboard de Streamlit en `localhost:8501` lee directamente del DWH y no necesita Airflow para nada. Si solo querés ver las métricas de fraude, abrí Streamlit y listo.
+
+### Limpiar runs zombies
+
+Si el scheduler crasheó en medio de un run, ese DAG run queda en estado `running` pero nadie lo está ejecutando. Hay que marcarlo como fallido para que no consuma recursos:
+
+```bash
+docker exec airflow-scheduler python -c "
+from airflow.models import DagRun
+from airflow.utils.db import create_session
+with create_session() as session:
+    runs = session.query(DagRun).filter(
+        DagRun.state == 'running',
+        DagRun.dag_id == 'securelink_fraud_pipeline'
+    ).all()
+    for r in runs:
+        r.state = 'failed'
+        print(f'Marked failed: {r.run_id}')
+    session.commit()
+"
+```
+
+Después reiniciá el scheduler: `docker restart airflow-scheduler`.
+
+### Cuidado al suspender la máquina mientras corre el pipeline
+
+Si Windows entra en suspensión mientras el DAG está procesando `ingest_transactions` (1.2 GB de CSV, 10-15 min en máquinas potentes, hasta varias horas con 4 GB de RAM), Docker puede pausar o matar los contenedores. Antes de triggerar un run largo:
+
+1. Buscá "Configuración de inicio/apagado y suspensión" en el menú inicio
+2. Cambiá "Suspender el equipo" a "Nunca" mientras dure el pipeline
+3. Restaurá el valor original cuando termine
+
+### Si Docker Desktop tira errores 500 (API)
+
+Si ves errores tipo `request returned 500 Internal Server Error for API route...`, Docker Desktop está colapsando por presión de memoria. Solución:
+
+1. Reiniciá Docker Desktop (clic derecho en el ícono de la barra de tareas → Restart)
+2. Esperá a que termine el reinicio (el ícono deja de girar)
+3. `docker compose up -d` para levantar todo de nuevo
+
+Los volúmenes con los datos del DWH se conservan, no hace falta reejecutar el pipeline.
 
 ---
 
@@ -228,6 +326,22 @@ Para esta entrega académica el alcance se limitó a **reglas explícitas**. La 
 - `validate_dwh` al inicio: si el DWH no responde, el DAG falla en segundos en lugar de a los 15 minutos.
 - Idempotencia con `UPSERT`: reejecutar el DAG actualiza, no duplica.
 
+### ¿Por qué worker `gevent` en el webserver y no `sync`?
+
+El worker `sync` por defecto de gunicorn forkea un proceso completo de Python por cada worker, cargando todo el código de Airflow (~500 MB por worker). En máquinas con poca RAM (≤ 6 GB), esto colisiona con el scheduler y la BD, causando OOM kills del webserver.
+
+`gevent` usa green threads cooperativos dentro de un único proceso, manteniendo el uso de memoria en ~150-200 MB. Como contrapartida requiere que ninguna tarea bloquee el event loop, pero el webserver de Airflow solo sirve HTTP y queries a la metadata DB, así que es seguro.
+
+Configurado via env vars en `docker-compose.yml`:
+```yaml
+- AIRFLOW__WEBSERVER__WORKERS=1
+- AIRFLOW__WEBSERVER__WORKER_CLASS=gevent
+- AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT=300
+- AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT=300
+```
+
+Y `gevent==23.9.1` agregado al `Dockerfile.airflow`.
+
 ---
 
 ## Arquitectura
@@ -310,10 +424,31 @@ docker compose up -d --build
 # Ver estado de los contenedores
 docker compose ps
 
+# Ver uso de memoria por contenedor (útil para diagnosticar OOM)
+docker stats --no-stream
+
 # Ver logs del scheduler de Airflow
 docker compose logs airflow-scheduler -f
 
-# Detener (conserva los datos del DWH)
+# Ver logs del webserver de Airflow
+docker compose logs airflow-webserver -f
+
+# Apagar solo el scheduler (libera RAM para usar el webserver)
+docker stop airflow-scheduler
+
+# Apagar solo el webserver (libera RAM para que corra el pipeline)
+docker stop airflow-webserver
+
+# Triggerar un DAG desde la línea de comandos (sin webserver)
+docker exec airflow-scheduler airflow dags trigger securelink_fraud_pipeline
+
+# Listar las ejecuciones del DAG (estado, fechas)
+docker exec airflow-scheduler airflow dags list-runs -d securelink_fraud_pipeline
+
+# Ver el estado de cada tarea de un run específico
+docker exec airflow-scheduler airflow tasks states-for-dag-run securelink_fraud_pipeline <RUN_ID>
+
+# Detener todo (conserva los datos del DWH)
 docker compose down
 
 # Detener y borrar los datos del DWH (requiere reejecutar el pipeline)
