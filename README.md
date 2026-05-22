@@ -181,6 +181,13 @@ Si ya hiciste el [setup inicial](#primera-ejecución-setup-inicial) al menos una
 docker compose up -d --build
 ```
 
+> ⚠️ **IMPORTANTE para los que vienen actualizando desde una versión anterior**:
+> esta versión agrega `gevent` como dependencia del worker del webserver. Después
+> de hacer `git pull` tenés que correr `docker compose up -d --build` (no alcanza con
+> `up -d`). El flag `--build` rebuildea la imagen de Airflow para instalar `gevent`;
+> sin esto, el webserver no levanta. Es solo la primera vez post-pull, después
+> volvés a usar `docker compose up -d` normal.
+
 | Servicio | URL | Credenciales |
 |---|---|---|
 | Airflow UI | http://localhost:8080 | `admin` / `admin` |
