@@ -248,7 +248,11 @@ def _transform_data(**context):
             & pl.col("amount").is_not_null()
             & pl.col("transaction_date").is_not_null()
         )
-        .unique(subset="transaction_id")
+        # Nota: NO se hace .unique(subset="transaction_id") porque rompe el streaming
+        # de Polars (requeriría materializar 13M transaction_ids en un hashset → OOM
+        # en máquinas con 4 GB de RAM). transaction_id es PK del CSV de origen, no
+        # debería haber duplicados. Si los hubiera, los maneja `INSERT ... ON CONFLICT
+        # DO NOTHING` del staging del load_to_dwh.
     )
 
     # ── Features derivadas ──
@@ -462,9 +466,11 @@ def _load_to_dwh(**context):
     # más rápido para bulk load. Sigue garantizando ACID al final del COMMIT.
     cur.execute("SET LOCAL synchronous_commit = OFF")
 
-    # ── transactions_processed via COPY ──
+    # ── transactions_processed via COPY a staging + INSERT ON CONFLICT ──
+    # Patrón: COPY a una tabla temporal (UNLOGGED, sin PK) y luego INSERT INTO ...
+    # SELECT FROM staging ON CONFLICT DO NOTHING. Esto da lo mejor de dos mundos:
+    # velocidad de COPY + idempotencia ante duplicados en el source.
     logger.info("  Preparando CSV para COPY...")
-    cur.execute("TRUNCATE TABLE transactions_processed")
 
     columns_in_order = [
         "transaction_id", "card_id", "user_id", "transaction_date", "amount",
@@ -474,6 +480,15 @@ def _load_to_dwh(**context):
         "has_chip", "card_on_dark_web", "credit_limit", "debt_income_ratio",
         "distance_km", "is_fraud", "is_suspicious", "suspicion_reasons",
     ]
+
+    # Crear tabla de staging temporal (vive solo durante la transacción)
+    cur.execute("""
+        CREATE TEMP TABLE _stg_transactions (
+            LIKE transactions_processed INCLUDING DEFAULTS
+        ) ON COMMIT DROP
+    """)
+    # En la staging quitamos el PK para que COPY no falle si hay dupes
+    cur.execute("ALTER TABLE _stg_transactions DROP CONSTRAINT IF EXISTS _stg_transactions_pkey")
 
     df = pl.read_parquet(PROCESSED_PATH)
     # Garantizar que estén todas las columnas (user_state no existe en el dataset, se rellena con NULL)
@@ -489,12 +504,23 @@ def _load_to_dwh(**context):
 
     with open(COPY_CSV_PATH, "r") as f:
         cur.copy_expert(
-            f"COPY transactions_processed ({', '.join(columns_in_order)}) "
+            f"COPY _stg_transactions ({', '.join(columns_in_order)}) "
             f"FROM STDIN WITH (FORMAT CSV, NULL '')",
             f
         )
     os.remove(COPY_CSV_PATH)
-    logger.info(f"  COPY completado: {total_rows:,} filas insertadas")
+    logger.info(f"  COPY a staging completado: {total_rows:,} filas")
+
+    # Mover de staging a la tabla final con dedup vía ON CONFLICT
+    cur.execute("TRUNCATE TABLE transactions_processed")
+    cur.execute(f"""
+        INSERT INTO transactions_processed ({', '.join(columns_in_order)})
+        SELECT DISTINCT ON (transaction_id) {', '.join(columns_in_order)}
+        FROM _stg_transactions
+        ON CONFLICT (transaction_id) DO NOTHING
+    """)
+    final_count = cur.rowcount
+    logger.info(f"  Insertadas en transactions_processed: {final_count:,} filas")
 
     # ── Métricas globales ──
     g = metrics["global"]
