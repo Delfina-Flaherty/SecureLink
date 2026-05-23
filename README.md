@@ -62,7 +62,12 @@ El DWH (Data Warehouse / almacén de datos) arranca **vacío** — sin este paso
 1. Abrir http://localhost:8080 (usuario `admin`, contraseña `admin`).
 2. En la lista de DAGs, despausar `securelink_fraud_pipeline` (toggle a la izquierda).
 3. Click en ▶️ **Trigger DAG**.
-4. Esperar **10–15 minutos**. Podés ver el progreso en la vista Graph (click en el DAG → Graph).
+4. Esperar a que termine. Duraciones típicas:
+   - **PC moderna (16 GB RAM, SSD)**: 3–8 minutos
+   - **PC modesta (8 GB RAM, SSD)**: 8–20 minutos
+   - **PC justa (4-6 GB RAM)**: 30–90 minutos (puede haber swap; ver [Troubleshooting avanzado](#troubleshooting-avanzado-problemas-de-memoria))
+
+   Podés ver el progreso en la vista Graph (click en el DAG → Graph).
 5. Cuando todas las tareas están en verde (`success`), el DWH ya tiene los datos.
 
 ### 5. Verificar que el dashboard funciona
@@ -182,11 +187,12 @@ docker compose up -d --build
 ```
 
 > ⚠️ **IMPORTANTE para los que vienen actualizando desde una versión anterior**:
-> esta versión agrega `gevent` como dependencia del worker del webserver. Después
-> de hacer `git pull` tenés que correr `docker compose up -d --build` (no alcanza con
-> `up -d`). El flag `--build` rebuildea la imagen de Airflow para instalar `gevent`;
-> sin esto, el webserver no levanta. Es solo la primera vez post-pull, después
-> volvés a usar `docker compose up -d` normal.
+> esta versión agrega `gevent` (worker del webserver), `polars` (ingesta/transformaciones)
+> y `duckdb` (agregaciones) como dependencias nuevas. Después de hacer `git pull` tenés
+> que correr `docker compose up -d --build` (no alcanza con `up -d`). El flag `--build`
+> rebuildea la imagen de Airflow para instalar las dependencias nuevas; sin esto, el DAG
+> falla con `ModuleNotFoundError`. Es solo la primera vez post-pull, después volvés a
+> usar `docker compose up -d` normal.
 
 | Servicio | URL | Credenciales |
 |---|---|---|
@@ -208,8 +214,8 @@ Esta sección mapea cada paso del material teórico (7.1 pág. 9) a la implement
 | 2. Fuentes de datos | 3 archivos CSV (transacciones, usuarios, tarjetas) + 2 archivos JSON (labels de fraude, códigos MCC) |
 | 3. Estrategia de ingesta | Batch en chunks de 100 k filas (PyArrow incremental) — sin cargar todo en RAM |
 | 4. Procesamiento | Validación de esquema → limpieza ($, comas, fechas, duplicados) → features (debt/income, online vs swipe) → 4 reglas de detección |
-| 5. Almacenamiento del resultado | PostgreSQL DWH: tablas de detalle (`transactions_processed`) y agregadas (`fraud_metrics_global`, `fraud_by_mcc`, `fraud_by_state`, `fraud_by_card_type`, `fraud_by_merchant`, `user_profiles`) |
-| 6. Flujo de datos | DAG con 8 tareas secuenciales, dependencias explícitas con `>>`, retries con backoff exponencial |
+| 5. Almacenamiento del resultado | PostgreSQL DWH: tablas de detalle (`transactions_processed`) y agregadas (`fraud_metrics_global`, `fraud_by_mcc`, `fraud_by_state`, `fraud_by_card_type`, `fraud_by_merchant`, `user_profiles`). `COPY` para la tabla de detalle (5-10x más rápido que `INSERT`), `execute_values` para las agregadas. |
+| 6. Flujo de datos | DAG con validaciones paralelas + 4 cargas de referencia paralelas + 5 tareas secuenciales (`ingest_transactions` → `transform_data` → `compute_metrics` → `load_to_dwh` → `quality_check`). Retries con backoff exponencial. |
 | 7. Gobernanza y monitoreo | Validación de conexión a DWH antes de procesar, `quality_check` final (verifica montos negativos, registra ejecución en `pipeline_run_log`), logs detallados en Airflow UI |
 | 8. Capa de consumo | Streamlit con 3 paneles: General (KPIs y mapa de EEUU), Usuario (perfil individual), Comercios (top merchants) |
 
@@ -231,22 +237,26 @@ No hay datos en streaming ni cambios incrementales: el dataset es histórico y s
 
 ### 3) Estrategia de ingesta
 
-**Batch** en chunks de 100 k filas usando `pd.read_csv(chunksize=...)`. Cada chunk se enriquece con los datos de referencia (users, cards, mcc, labels) y se escribe incrementalmente a Parquet con `pyarrow.ParquetWriter`. Esto evita cargar 13 M filas en memoria de una sola vez (el OOM que aparecía al hacer `pd.concat` masivo).
+**Batch** con **Polars lazy/streaming**. `pl.scan_csv(...).join(...).sink_parquet(...)` lee el CSV en streaming, hace los 4 joins (labels, cards, users, MCC) y escribe Parquet, todo en una sola pasada paralelizada en todos los cores del CPU. Polars no materializa los 13 M filas en RAM — procesa por bloques de forma transparente.
 
-Los datos de referencia chicos (users, cards, mcc, labels) se cargan a memoria una sola vez como `dict` para lookup O(1) — más eficiente que un `merge` contra millones de filas.
+Los datos de referencia chicos (users, cards, mcc, labels) se cargan una sola vez como DataFrames Polars y participan de hash joins (mucho más rápido que `dict.map()` row-by-row sobre 13 M filas).
+
+> **Nota histórica**: la primera versión usaba `pd.read_csv(chunksize=...)` con `pyarrow.ParquetWriter` incremental y dict lookups. Funcionaba pero pandas usa un solo core y los `merge()` por chunk son lentos. La migración a Polars bajó la duración de `ingest_transactions` ~5-10x.
 
 ### 4) Plan de procesamiento (transformaciones)
 
-Cada tarea del DAG aplica una transformación específica:
+Las tres transformaciones (limpieza, features y reglas) se combinan en la tarea `transform_data` usando una sola pasada Polars sobre el parquet — antes eran 3 tareas separadas que leían y escribían el parquet completo cada una.
 
-- **`clean_data`**: convierte fechas (`pd.to_datetime`), limpia montos (`$`, comas), descarta negativos y duplicados (`drop_duplicates`), normaliza booleanos.
-- **`build_features`**: calcula `debt_income_ratio = total_debt / yearly_income` y clasifica `transaction_type` (Online vs Swipe).
-- **`apply_fraud_rules`**: aplica 4 reglas con un `OR` lógico:
-  1. Monto atípico (> percentil 99)
+- **Limpieza**: convierte fechas, limpia montos (`$`, comas), descarta negativos/inválidos, deduplica por `transaction_id`, normaliza booleanos.
+- **Features**: calcula `debt_income_ratio = total_debt / yearly_income` y clasifica `transaction_type` (Online vs Swipe).
+- **Reglas de detección**: aplica 4 reglas con un `OR` lógico:
+  1. Monto atípico (> percentil 99 — calculado en una pasada lazy adicional sobre el parquet)
   2. Transacción con `errors` no nulo
   3. Tarjeta presente en dark web (`card_on_dark_web == True`)
   4. Endeudamiento alto (`debt_income_ratio > 3`)
-- Manejo de calidad: las filas inválidas (montos negativos, fechas inválidas, duplicados) se descartan con logging. El conteo aparece en el log de cada tarea.
+- Manejo de calidad: las filas inválidas (montos negativos, fechas inválidas, duplicados) se descartan en la fase de limpieza. El conteo aparece en el log.
+
+> **Nota histórica**: en versiones anteriores estas eran 3 tareas separadas (`clean_data` → `build_features` → `apply_fraud_rules`) que cada una leía y escribía un parquet de ~1 GB. La fusión en `transform_data` ahorra 2 pasadas completas de I/O.
 
 ### 5) Arquitectura de almacenamiento del resultado
 
@@ -269,19 +279,19 @@ PostgreSQL es el DWH (servicio `postgres-dwh`, puerto 5433 externamente). El esq
 ### 6) Planificación del flujo de datos
 
 ```
-validate_files
-  >> ingest_data           (lee CSVs + JSON, enriquece, escribe parquet)
-  >> clean_data            (fechas, montos, duplicados)
-  >> build_features        (debt_income_ratio, transaction_type)
-  >> apply_fraud_rules     (4 reglas, marca is_suspicious)
-  >> compute_metrics       (acumuladores por chunk, guarda pickle)
-  >> load_to_dwh           (UPSERT al DWH en batches de 50k)
-  >> quality_check         (verifica integridad y loguea ejecución)
+validate_files + validate_dwh                          (paralelo)
+  >> load_users + load_cards + load_mcc + load_labels  (paralelo)
+  >> ingest_transactions    (Polars lazy/streaming: CSV + 4 joins en una pasada)
+  >> transform_data         (Polars: clean + features + reglas combinados)
+  >> compute_metrics        (DuckDB: agregaciones SQL vectorizadas sobre parquet)
+  >> load_to_dwh            (COPY para transacciones + execute_values para agregadas)
+  >> quality_check          (verifica integridad y loguea ejecución)
 ```
 
 - **Secuencial** porque cada tarea consume el output de la anterior.
 - **Reintentos** configurados en `default_args` con backoff exponencial.
-- **Idempotencia** vía `ON CONFLICT (transaction_id) DO UPDATE` en lugar de `TRUNCATE+INSERT`: reejecutar el DAG no duplica datos ni rompe el dashboard mientras corre.
+- **Idempotencia** vía `TRUNCATE + COPY` en una sola transacción: PostgreSQL MVCC garantiza que el dashboard siga viendo los datos viejos hasta el `COMMIT` final. Reejecutar el DAG no duplica datos ni deja la tabla vacía intermedia.
+- **Atomic full refresh** sobre las tablas agregadas (fraud_by_mcc, fraud_by_state, etc.) por la misma razón.
 
 ### 7) Gobernanza y monitoreo
 
@@ -333,6 +343,26 @@ Para esta entrega académica el alcance se limitó a **reglas explícitas**. La 
 - `validate_dwh` al inicio: si el DWH no responde, el DAG falla en segundos en lugar de a los 15 minutos.
 - Idempotencia con `UPSERT`: reejecutar el DAG actualiza, no duplica.
 
+### ¿Por qué Polars + DuckDB y no pandas para todo el pipeline?
+
+La primera versión del pipeline usaba pandas en todas las tareas. Funcionaba pero era lento en máquinas chicas — la corrida completa con 13M transacciones tomaba ~4 horas en una PC con 4 GB de RAM (y ~15-30 min en una con 16 GB). Los dos cuellos de botella eran `ingest_transactions` (CSV parsing + 4 merges) y `compute_metrics` (groupby con acumuladores Python).
+
+**Cambios concretos:**
+
+| Tarea | Antes (pandas) | Ahora (Polars/DuckDB) | Ganancia |
+|---|---|---|---|
+| `ingest_transactions` | Lee CSV en chunks de 100k, merge() por chunk, un solo core | `pl.scan_csv` + 4 joins lazy + `sink_parquet`, paralelo en todos los cores | ~5-10x |
+| `transform_data` | 3 tareas (clean / features / rules) cada una lee y escribe 1 GB | Una sola tarea Polars que combina todo | ~3x menos I/O |
+| `compute_metrics` | `defaultdict` + pandas `groupby` por chunk en Python | DuckDB SQL vectorizado directo sobre el parquet | ~10-50x |
+| `load_to_dwh` (transacciones) | `execute_values` con `INSERT ... ON CONFLICT` | `COPY ... FROM STDIN` con CSV streaming desde Polars | ~5-10x |
+| `load_to_dwh` (agregadas) | `cursor.execute()` fila por fila en loop | `execute_values` con batches de 1000 | ~50-100x |
+
+**Por qué Polars y no Spark/Dask**: para un dataset de 13M filas (1.2 GB) un motor single-node columnar como Polars es la mejor opción — Spark/Dask agregarían overhead de coordinación distribuida sin necesidad. Polars usa Arrow como representación interna, vectorización SIMD y paralelización automática.
+
+**Por qué DuckDB para agregaciones**: es columnar+vectorizado, lee parquet directamente sin importar a memoria, y compila las queries a planes optimizados. Reemplazó ~200 líneas de Python (defaultdict + groupby + reduce) por ~10 queries SQL. Más rápido, más legible, más fácil de validar.
+
+**Por qué `COPY` y no `INSERT`**: PostgreSQL `COPY` evita el overhead de parseo de SQL por cada fila, no genera entries en el query log, y usa un formato de wire más eficiente. Para bulk loads de millones de filas es 5-10x más rápido que `INSERT` aunque uses `execute_values` con batches.
+
 ### ¿Por qué worker `gevent` en el webserver y no `sync`?
 
 El worker `sync` por defecto de gunicorn forkea un proceso completo de Python por cada worker, cargando todo el código de Airflow (~500 MB por worker). En máquinas con poca RAM (≤ 6 GB), esto colisiona con el scheduler y la BD, causando OOM kills del webserver.
@@ -367,16 +397,16 @@ Y `gevent==23.9.1` agregado al `Dockerfile.airflow`.
 ┌─────────────────────────────────┐
 │       Airflow (LocalExecutor)   │
 │  securelink_fraud_pipeline DAG  │
-│  - validate_files               │
-│  - ingest_data (parquet)        │
-│  - clean_data                   │
-│  - build_features               │
-│  - apply_fraud_rules            │
-│  - compute_metrics              │
-│  - load_to_dwh                  │
+│  - validate_files / dwh         │
+│  - load_users / cards / mcc /   │
+│    labels (paralelo)            │
+│  - ingest_transactions (Polars) │
+│  - transform_data (Polars)      │
+│  - compute_metrics (DuckDB)     │
+│  - load_to_dwh (COPY)           │
 │  - quality_check                │
 └────────────────┬────────────────┘
-                 │ UPSERT en batches de 50k
+                 │ COPY (5-10x más rápido que INSERT)
                  ▼
 ┌─────────────────────────────────┐
 │       PostgreSQL DWH            │

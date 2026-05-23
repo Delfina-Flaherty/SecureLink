@@ -16,3 +16,10 @@ RUN pip install --no-cache-dir --constraint "${AIRFLOW_CONSTRAINTS_URL}" \
     "pandas>=2.0,<3" \
     "openpyxl>=3.1,<4" \
     gevent==23.9.1
+
+# Engines optimizados para el pipeline: Polars (CSV/joins paralelizados) y DuckDB
+# (agregaciones SQL vectorizadas sobre parquet). Ambos sin constraint porque no
+# son dependencias de Airflow.
+RUN pip install --no-cache-dir \
+    "polars>=0.20,<1.0" \
+    "duckdb>=0.10,<2.0"
