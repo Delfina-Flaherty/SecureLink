@@ -514,9 +514,68 @@ Evolución prevista (sección SRS 2d):
 
 ## Evolución a tiempo real
 
-El nombre completo del proyecto en el SRS es *"SecureLink – Análisis de Transacciones Financieras en **Tiempo Real**"*, y la sección 2.d del SRS lista explícitamente como evolución previsible la *"detección de fraude en tiempo real sobre transacciones entrantes"*. El alcance actual del MVP es **batch analítico diario** sobre datos históricos — esta sección describe cómo se haría la transición a streaming sin reescribir la lógica de negocio.
+El nombre completo del proyecto en el SRS es *"SecureLink – Análisis de Transacciones Financieras en **Tiempo Real**"*, y la sección 2.d del SRS lista explícitamente como evolución previsible la *"detección de fraude en tiempo real sobre transacciones entrantes"*. El alcance actual del MVP es **batch analítico diario** sobre datos históricos — esta sección describe cómo se haría la transición de forma **incremental** en dos etapas, sin reescribir la lógica de negocio.
 
-### Arquitectura propuesta
+### El espectro de "tiempo real"
+
+"Tiempo real" no es binario: hay varios niveles según la latencia objetivo y la complejidad de infraestructura aceptable.
+
+| Nivel | Patrón | Latencia | Engine típico | Quién lo usa |
+|---|---|---|---|---|
+| 1. **Batch tradicional** | Procesar todo cada N horas/días | Horas-días | pandas / Polars / Spark batch | **SecureLink MVP actual** (`@daily`) |
+| 2. **Micro-batch con CDC** | Mini-corridas frecuentes con cambios incrementales | 1-5 min | Igual que batch + scheduler frecuente | **Proyecto ejemplo Black Friday** (`*/1 * * * *`) |
+| 3. **Streaming verdadero** | Procesar cada evento al instante | Milisegundos | Kafka + Flink / Kafka Streams | Sistemas de fraud detection productivos (Visa, Stripe) |
+
+La evolución natural de SecureLink es **1 → 2 → 3**: primero migrar a micro-batch siguiendo el patrón del ejemplo Black Friday (cambio pequeño), después a streaming verdadero cuando la latencia de minutos no alcance (cambio grande de infraestructura).
+
+---
+
+### Etapa 1 — Micro-batch con CDC (estilo Black Friday)
+
+Replica el patrón del proyecto ejemplo: Airflow corre el DAG cada 1-5 minutos, cada corrida procesa solo las transacciones nuevas usando **CDC (Change Data Capture)** por timestamp. **Sin Kafka, sin Flink** — solo cambios en el DAG actual.
+
+**Cambios necesarios respecto al MVP actual:**
+
+| Aspecto | MVP actual (batch diario) | Etapa 1 (micro-batch CDC) |
+|---|---|---|
+| **Schedule** | `@daily` | `*/1 * * * *` (cada minuto) o `*/5 * * * *` (cada 5 min) |
+| **Fuente de datos** | CSV estático en `./data/` | API REST del procesador de pagos o PostgreSQL del banco emisor |
+| **Estrategia de ingesta** | Full refresh (lee todo el CSV) | CDC incremental: `WHERE last_updated >= data_interval_start` |
+| **Volumen por corrida** | 13 M filas | Decenas-cientos de filas (las nuevas del último minuto) |
+| **Engine** | Polars + DuckDB (volumen grande) | pandas / Polars (volumen chico — pandas alcanza) |
+| **Patrón de carga al DWH** | `TRUNCATE` + `COPY` (atomic full refresh) | `INSERT ... ON CONFLICT DO UPDATE` (UPSERT incremental) |
+| **Comunicación entre tareas** | Parquet/pickle en `/tmp` | XCom (datos chicos por corrida) |
+| **Cantidad de tareas** | 11 | ~7-8 (las cargas paralelas de referencia ya no se reejecutan, se cachean) |
+
+**Esquema de tareas resultante** (idéntico al de Black Friday):
+
+```
+validate_source + validate_dwh           (paralelo)
+  >> extract_transactions_cdc            (consulta API/DB con filtro por last_updated)
+  >> transform_unify                     (limpia + enriquece + aplica reglas)
+  >> load_aggregate                      (UPSERT al DWH + actualiza métricas)
+  >> quality_check                       (control de calidad de la mini-corrida)
+```
+
+**Ventajas:**
+- Sigue el patrón canónico del material 7.x y del ejemplo Black Friday
+- Cambios mínimos en infraestructura: el mismo Airflow + PostgreSQL ya montados
+- Latencia de minutos, suficiente para muchos casos de uso de fraude no críticos (revisión de reportes diarios, alertas no bloqueantes)
+
+**Limitaciones:**
+- Latencia mínima ~1 minuto (no apto para bloquear transacciones en POS)
+- Si una corrida falla, los datos quedan pendientes hasta la próxima (no hay reintento por evento)
+- El scheduler de Airflow agrega overhead (parsea el DAG cada minuto)
+
+**Cuándo conviene esta etapa:** cuando el negocio acepta latencia de 1-5 minutos. Por ejemplo: alertas al equipo de fraude para investigación post-hoc, dashboards de monitoreo, generación de reportes near-real-time.
+
+---
+
+### Etapa 2 — Streaming verdadero (Kafka + Flink)
+
+Cuando la latencia de minutos no alcanza (típicamente: bloquear una transacción **en el POS antes de aprobarla**, lo cual exige <1 segundo), hay que pasar a streaming event-driven. **Esto sí cambia la arquitectura de infraestructura**.
+
+**Arquitectura propuesta:**
 
 ```
 ┌─────────────────────────┐
@@ -560,9 +619,11 @@ El nombre completo del proyecto en el SRS es *"SecureLink – Análisis de Trans
 └─────────────────────────┘
 ```
 
-### Mapeo del pipeline actual al diseño streaming
+**Diferencia clave con la Etapa 1:** las fuentes ahora **publican** eventos (push), no que el pipeline los **consulte** (pull). El procesador (Flink) mantiene estado continuo en memoria (ventanas deslizantes), garantiza exactly-once con checkpointing, y procesa cada evento en milisegundos.
 
-| Tarea actual | Equivalente en streaming |
+**Mapeo del pipeline actual a streaming:**
+
+| Tarea actual | Equivalente en Etapa 2 (streaming) |
 |---|---|
 | `ingest_transactions` (lee CSV) | **Kafka producer** — las APIs publican cada transacción como evento |
 | `transform_data` (Polars batch) | **Flink job** — misma lógica de limpieza/features pero sobre el stream |
@@ -570,43 +631,32 @@ El nombre completo del proyecto en el SRS es *"SecureLink – Análisis de Trans
 | `load_to_dwh` (`TRUNCATE` + `COPY` masivo) | **Flink JDBC sink** — micro-batches de 30 s al DWH (`INSERT` incremental) |
 | `quality_check` (validación final del batch) | **Continuous monitoring** — checks de latencia, throughput y error rate del stream |
 
-### Lo que se mantiene
+**Requisitos adicionales que solo aplican a la Etapa 2:**
 
-- **Las 4 reglas de detección de fraude**: es lógica de negocio, no de infraestructura. El mismo código Python que evalúa `amount > p99`, `errors not null`, etc., corre dentro del operador Flink.
-- **El schema del DWH**: `transactions_processed`, `fraud_metrics_global` y las agregadas no cambian. Lo que cambia es cómo se pueblan.
-- **El dashboard Streamlit**: las queries siguen funcionando contra las mismas tablas. Solo se ajusta el TTL del cache para que refresque más seguido.
+1. **Infraestructura distribuida nueva**: cluster Kafka (~3 brokers mínimo) + cluster Flink (~2 task managers) + Redis. El single-node con LocalExecutor del MVP no alcanza.
+2. **Modelo de ML** (también en SRS 2.d): las reglas heurísticas dan resultados aceptables en batch/micro-batch, pero en streaming se prefiere un score probabilístico de un modelo entrenado (XGBoost / LightGBM) para calibrar el umbral según el costo de FP vs FN.
+3. **Sistema de alertas event-driven**: consumer del topic `alertas` que notifica al cliente, bloquea la tarjeta vía API y genera tickets. No existe en el MVP.
+4. **Garantías de orden y exactly-once**: Flink con checkpointing + Kafka con particionado por `card_id` garantizan que no se procese dos veces ni se pierda una transacción.
+
+---
+
+### Lo que se mantiene en ambas etapas
+
+- **Las 4 reglas de detección de fraude**: es lógica de negocio, no de infraestructura. El mismo código Python que evalúa `amount > p99`, `errors not null`, etc., corre tanto en pandas (Etapa 1) como dentro de un operador Flink (Etapa 2).
+- **El schema del DWH**: `transactions_processed`, `fraud_metrics_global` y las agregadas no cambian. Lo que cambia es cómo se pueblan (UPSERT incremental vs sink streaming).
+- **El dashboard Streamlit**: las queries siguen funcionando contra las mismas tablas.
 - **Filosofía de control de calidad y observabilidad**: logs por tarea, métricas de pipeline, validaciones explícitas.
 
-### Lo que cambia
+### ¿Por qué el MVP es batch y no micro-batch desde el día 1?
 
-| Aspecto | Batch actual | Streaming futuro |
-|---|---|---|
-| **Latencia** | Horas (batch diario) | Milisegundos por transacción |
-| **Volumen por mensaje** | 1.2 GB (todo el CSV) | ~1 KB por evento |
-| **Engine de procesamiento** | Polars + DuckDB | Apache Flink / Kafka Streams |
-| **Patrón de carga al DWH** | `TRUNCATE` + `COPY` atómico | Micro-batches incrementales (`INSERT`) |
-| **Storage adicional** | — | Redis para state de ventanas deslizantes |
-| **Detección** | Reglas heurísticas | Idealmente modelo ML con score probabilístico |
-
-### Requisitos adicionales para producción
-
-1. **Fuentes de datos reales**: hoy son CSVs estáticos; en producción se conecta a APIs de procesadores de pagos o se suscribe a un topic Kafka publicado por ellos.
-2. **Modelo de ML** (también en SRS 2.d): las reglas heurísticas dan resultados aceptables en batch, pero en tiempo real un score probabilístico de un modelo entrenado (XGBoost / LightGBM) permite calibrar el umbral según el costo de FP vs FN.
-3. **Sistema de alertas**: notificación push al cliente, bloqueo automático de la tarjeta vía API, generación de tickets para el equipo de fraude. No existe en el MVP actual.
-4. **Latencia objetivo**: <1 segundo desde que se publica el evento hasta que se emite la alerta (vs los ~30 min del batch actual).
-5. **Garantías de orden y exactly-once**: Flink con checkpointing + Kafka con particionado por `card_id` garantizan que no se procese dos veces ni se pierda una transacción.
-6. **Infraestructura distribuida**: Kafka + Flink + Redis como cluster (vs el single-node actual con LocalExecutor).
-
-### ¿Por qué el MVP es batch y no streaming desde el día 1?
-
-Porque para esta entrega académica el **dataset disponible es histórico y estático** (~1.2 GB de transacciones 2010-2019). No tiene sentido montar Kafka + Flink para reproducir datos que ya están todos en un CSV — sería over-engineering. El batch actual:
+Porque para esta entrega académica el **dataset disponible es histórico y estático** (~1.2 GB de transacciones 2010-2019). No hay un sistema productivo del que extraer cambios incrementales — los datos están todos en un CSV. Implementar CDC sobre datos estáticos sería forzado y no demostraría nada nuevo. El batch actual:
 
 - Demuestra todo el ciclo de un pipeline ETL bien diseñado (8 pasos del material 7.1)
 - Procesa el volumen real (13 M filas) con buena performance (Polars + DuckDB + COPY)
 - Produce las mismas métricas que tendría el sistema en producción
-- **Tiene una migración bien definida a streaming** (esta sección lo demuestra)
+- **Tiene una migración bien definida a tiempo real en dos etapas** (esta sección lo demuestra)
 
-La transición a tiempo real es **incremental, no destructiva**: la lógica de negocio (reglas, schema, dashboard) se reutiliza. Solo cambian las fuentes y el engine de procesamiento.
+La transición es **incremental, no destructiva**: la lógica de negocio (reglas, schema, dashboard) se reutiliza en ambas etapas. Solo cambian las fuentes y el engine de procesamiento.
 
 ---
 
