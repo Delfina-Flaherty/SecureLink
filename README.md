@@ -507,8 +507,106 @@ Evolución prevista (sección SRS 2d):
 
 1. **Modelo de ML**: entrenar con `train_fraud_labels.json` y reemplazar las 4 reglas por un score probabilístico.
 2. **API REST**: exponer el score de fraude para consultas en línea desde otros sistemas.
-3. **Streaming**: pasar a Kafka + Flink si surge la necesidad de detección en tiempo real.
+3. **Streaming**: pasar a Kafka + Flink si surge la necesidad de detección en tiempo real (ver siguiente sección).
 4. **Geolocalización real**: implementar `distance_km` entre merchant y usuario (hoy queda en `NaN`).
+
+---
+
+## Evolución a tiempo real
+
+El nombre completo del proyecto en el SRS es *"SecureLink – Análisis de Transacciones Financieras en **Tiempo Real**"*, y la sección 2.d del SRS lista explícitamente como evolución previsible la *"detección de fraude en tiempo real sobre transacciones entrantes"*. El alcance actual del MVP es **batch analítico diario** sobre datos históricos — esta sección describe cómo se haría la transición a streaming sin reescribir la lógica de negocio.
+
+### Arquitectura propuesta
+
+```
+┌─────────────────────────┐
+│ APIs de procesadores    │  Visa / Mastercard / banco emisor
+│ de pagos                │  publican cada transacción como evento
+└───────────┬─────────────┘
+            │ ~1 KB por evento
+            ▼
+┌─────────────────────────┐
+│   Kafka (event bus)     │  Topic "transactions"
+│   Particionado por      │  particionado por card_id
+│   card_id               │  (orden garantizado por tarjeta)
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│  Apache Flink           │  Mismas 4 reglas que el batch actual
+│  (stream processor)     │  + features en ventanas deslizantes:
+│                         │    - txns/usuario en últimos 5 min
+│                         │    - distancia entre comercios consecutivos
+│                         │    - desviación del monto vs perfil histórico
+└─────┬─────────────┬─────┘
+      │             │
+      ▼             ▼
+┌──────────┐  ┌──────────────┐
+│  Redis   │  │ Topic Kafka  │  → Sistema de alertas:
+│ (state / │  │  "alertas"   │     notifica al cliente,
+│  cache)  │  │              │     bloquea tarjeta si aplica,
+└────┬─────┘  └──────────────┘     genera ticket de fraude
+     │
+     ▼
+┌─────────────────────────┐
+│  PostgreSQL DWH         │  Sink incremental desde Flink
+│  (mismo schema actual)  │  en micro-batches de ~30 s
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│  Streamlit Dashboard    │  Con auto-refresh corto o
+│  (igual al actual)      │  WebSocket para alertas push
+└─────────────────────────┘
+```
+
+### Mapeo del pipeline actual al diseño streaming
+
+| Tarea actual | Equivalente en streaming |
+|---|---|
+| `ingest_transactions` (lee CSV) | **Kafka producer** — las APIs publican cada transacción como evento |
+| `transform_data` (Polars batch) | **Flink job** — misma lógica de limpieza/features pero sobre el stream |
+| `compute_metrics` (DuckDB) | **Flink windowing** — agregaciones continuas en ventanas + state en Redis |
+| `load_to_dwh` (`TRUNCATE` + `COPY` masivo) | **Flink JDBC sink** — micro-batches de 30 s al DWH (`INSERT` incremental) |
+| `quality_check` (validación final del batch) | **Continuous monitoring** — checks de latencia, throughput y error rate del stream |
+
+### Lo que se mantiene
+
+- **Las 4 reglas de detección de fraude**: es lógica de negocio, no de infraestructura. El mismo código Python que evalúa `amount > p99`, `errors not null`, etc., corre dentro del operador Flink.
+- **El schema del DWH**: `transactions_processed`, `fraud_metrics_global` y las agregadas no cambian. Lo que cambia es cómo se pueblan.
+- **El dashboard Streamlit**: las queries siguen funcionando contra las mismas tablas. Solo se ajusta el TTL del cache para que refresque más seguido.
+- **Filosofía de control de calidad y observabilidad**: logs por tarea, métricas de pipeline, validaciones explícitas.
+
+### Lo que cambia
+
+| Aspecto | Batch actual | Streaming futuro |
+|---|---|---|
+| **Latencia** | Horas (batch diario) | Milisegundos por transacción |
+| **Volumen por mensaje** | 1.2 GB (todo el CSV) | ~1 KB por evento |
+| **Engine de procesamiento** | Polars + DuckDB | Apache Flink / Kafka Streams |
+| **Patrón de carga al DWH** | `TRUNCATE` + `COPY` atómico | Micro-batches incrementales (`INSERT`) |
+| **Storage adicional** | — | Redis para state de ventanas deslizantes |
+| **Detección** | Reglas heurísticas | Idealmente modelo ML con score probabilístico |
+
+### Requisitos adicionales para producción
+
+1. **Fuentes de datos reales**: hoy son CSVs estáticos; en producción se conecta a APIs de procesadores de pagos o se suscribe a un topic Kafka publicado por ellos.
+2. **Modelo de ML** (también en SRS 2.d): las reglas heurísticas dan resultados aceptables en batch, pero en tiempo real un score probabilístico de un modelo entrenado (XGBoost / LightGBM) permite calibrar el umbral según el costo de FP vs FN.
+3. **Sistema de alertas**: notificación push al cliente, bloqueo automático de la tarjeta vía API, generación de tickets para el equipo de fraude. No existe en el MVP actual.
+4. **Latencia objetivo**: <1 segundo desde que se publica el evento hasta que se emite la alerta (vs los ~30 min del batch actual).
+5. **Garantías de orden y exactly-once**: Flink con checkpointing + Kafka con particionado por `card_id` garantizan que no se procese dos veces ni se pierda una transacción.
+6. **Infraestructura distribuida**: Kafka + Flink + Redis como cluster (vs el single-node actual con LocalExecutor).
+
+### ¿Por qué el MVP es batch y no streaming desde el día 1?
+
+Porque para esta entrega académica el **dataset disponible es histórico y estático** (~1.2 GB de transacciones 2010-2019). No tiene sentido montar Kafka + Flink para reproducir datos que ya están todos en un CSV — sería over-engineering. El batch actual:
+
+- Demuestra todo el ciclo de un pipeline ETL bien diseñado (8 pasos del material 7.1)
+- Procesa el volumen real (13 M filas) con buena performance (Polars + DuckDB + COPY)
+- Produce las mismas métricas que tendría el sistema en producción
+- **Tiene una migración bien definida a streaming** (esta sección lo demuestra)
+
+La transición a tiempo real es **incremental, no destructiva**: la lógica de negocio (reglas, schema, dashboard) se reutiliza. Solo cambian las fuentes y el engine de procesamiento.
 
 ---
 
