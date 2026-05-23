@@ -2,7 +2,7 @@
 
 Pipeline ETL orquestado con **Apache Airflow** que procesa transacciones financieras históricas, aplica reglas de detección de fraude y publica métricas en un dashboard analítico.
 
-El proyecto sigue el **framework de 8 pasos** visto en clase (material 7.1 – Fundamentos de ETL y Pipelines) y la guía del ejemplo Black Friday.
+El proyecto está estructurado según el **framework de 8 pasos** para el diseño de pipelines ETL.
 
 ---
 
@@ -206,7 +206,7 @@ Si el DWH conserva los datos de una corrida anterior (volumen no borrado), el da
 
 ## Los 8 pasos del pipeline aplicados a SecureLink
 
-Esta sección mapea cada paso del material teórico (7.1 pág. 9) a la implementación concreta del proyecto.
+Esta sección mapea cada paso del framework de diseño a la implementación concreta del proyecto.
 
 | Paso (diseño) | En este proyecto |
 |---|---|
@@ -301,7 +301,7 @@ validate_files + validate_dwh                          (paralelo)
 - **Logs**: cada tarea loguea conteos antes/después, los logs son visibles en la UI de Airflow (`/Graph` → click en la tarea → `Logs`).
 - **Auditoría**: `pipeline_run_log` registra cada ejecución con timestamp, status y conteos.
 
-*Nota de laboratorio*: las credenciales viven en `docker-compose.yml` (variables de entorno). En producción se usarían secretos gestionados (Vault, AWS Secrets Manager) — el material 7.4 lo recomienda explícitamente.
+*Nota*: las credenciales viven en `docker-compose.yml` (variables de entorno) para simplificar el setup local. En producción se usarían secretos gestionados (Vault, AWS Secrets Manager).
 
 ### 8) Capa de consumo
 
@@ -442,7 +442,7 @@ SecureLink/
 ├── init_sql/
 │   └── init_dwh.sql                    # Schema del DWH (se ejecuta al primer arranque)
 ├── data/                               # Archivos CSV/JSON de entrada
-├── extra/                              # Material del curso (PDFs) y plantilla SRS
+├── extra/                              # Documentos de referencia y plantilla SRS
 ├── logs/                               # Logs de Airflow (se crea automáticamente)
 ├── Dockerfile.airflow                  # Imagen custom de Airflow (con PyArrow, pandas)
 ├── Dockerfile.streamlit                # Imagen del dashboard
@@ -496,7 +496,7 @@ docker compose down -v
 
 ## Escalabilidad y evolución prevista
 
-El material 7.2 plantea escalar con **particionamiento, infraestructura elástica, procesamiento distribuido y formato columnar**. SecureLink ya cumple parcialmente:
+Las estrategias clásicas de escalamiento son **particionamiento, infraestructura elástica, procesamiento distribuido y formato columnar**. SecureLink ya cumple parcialmente:
 
 - ✅ Formato columnar (Parquet) en archivos intermedios.
 - ✅ Procesamiento en chunks (no carga todo en RAM).
@@ -520,19 +520,19 @@ El nombre completo del proyecto en el SRS es *"SecureLink – Análisis de Trans
 
 "Tiempo real" no es binario: hay varios niveles según la latencia objetivo y la complejidad de infraestructura aceptable.
 
-| Nivel | Patrón | Latencia | Engine típico | Quién lo usa |
+| Nivel | Patrón | Latencia | Engine típico | Casos de uso típicos |
 |---|---|---|---|---|
-| 1. **Batch tradicional** | Procesar todo cada N horas/días | Horas-días | pandas / Polars / Spark batch | **SecureLink MVP actual** (`@daily`) |
-| 2. **Micro-batch con CDC** | Mini-corridas frecuentes con cambios incrementales | 1-5 min | Igual que batch + scheduler frecuente | **Proyecto ejemplo Black Friday** (`*/1 * * * *`) |
-| 3. **Streaming verdadero** | Procesar cada evento al instante | Milisegundos | Kafka + Flink / Kafka Streams | Sistemas de fraud detection productivos (Visa, Stripe) |
+| 1. **Batch tradicional** | Procesar todo cada N horas/días | Horas-días | pandas / Polars / Spark batch | Análisis histórico, reportes diarios. **SecureLink MVP actual** (`@daily`) |
+| 2. **Micro-batch con CDC** | Mini-corridas frecuentes con cambios incrementales | 1-5 min | Airflow con scheduler frecuente + pandas/Polars | Reportes near-real-time, dashboards de monitoreo, alertas no bloqueantes |
+| 3. **Streaming verdadero** | Procesar cada evento al instante | Milisegundos | Kafka + Flink / Kafka Streams | Decisión transaccional en POS (bloquear o aprobar la operación), notificación push al cliente |
 
-La evolución natural de SecureLink es **1 → 2 → 3**: primero migrar a micro-batch siguiendo el patrón del ejemplo Black Friday (cambio pequeño), después a streaming verdadero cuando la latencia de minutos no alcance (cambio grande de infraestructura).
+La evolución natural de SecureLink es **1 → 2 → 3**: primero migrar a micro-batch (cambio pequeño en el DAG actual, sin nueva infraestructura), después a streaming verdadero cuando la latencia de minutos no alcance (cambio grande de infraestructura).
 
 ---
 
-### Etapa 1 — Micro-batch con CDC (estilo Black Friday)
+### Etapa 1 — Micro-batch con CDC
 
-Replica el patrón del proyecto ejemplo: Airflow corre el DAG cada 1-5 minutos, cada corrida procesa solo las transacciones nuevas usando **CDC (Change Data Capture)** por timestamp. **Sin Kafka, sin Flink** — solo cambios en el DAG actual.
+Airflow corre el DAG cada 1-5 minutos, cada corrida procesa solo las transacciones nuevas usando **CDC (Change Data Capture)** por timestamp. **Sin Kafka, sin Flink** — solo cambios en el DAG actual.
 
 **Cambios necesarios respecto al MVP actual:**
 
@@ -547,7 +547,7 @@ Replica el patrón del proyecto ejemplo: Airflow corre el DAG cada 1-5 minutos, 
 | **Comunicación entre tareas** | Parquet/pickle en `/tmp` | XCom (datos chicos por corrida) |
 | **Cantidad de tareas** | 11 | ~7-8 (las cargas paralelas de referencia ya no se reejecutan, se cachean) |
 
-**Esquema de tareas resultante** (idéntico al de Black Friday):
+**Esquema de tareas resultante**:
 
 ```
 validate_source + validate_dwh           (paralelo)
@@ -558,7 +558,7 @@ validate_source + validate_dwh           (paralelo)
 ```
 
 **Ventajas:**
-- Sigue el patrón canónico del material 7.x y del ejemplo Black Friday
+- Sigue el patrón canónico de Airflow para pipelines incrementales con CDC
 - Cambios mínimos en infraestructura: el mismo Airflow + PostgreSQL ya montados
 - Latencia de minutos, suficiente para muchos casos de uso de fraude no críticos (revisión de reportes diarios, alertas no bloqueantes)
 
@@ -649,9 +649,9 @@ Cuando la latencia de minutos no alcanza (típicamente: bloquear una transacció
 
 ### ¿Por qué el MVP es batch y no micro-batch desde el día 1?
 
-Porque para esta entrega académica el **dataset disponible es histórico y estático** (~1.2 GB de transacciones 2010-2019). No hay un sistema productivo del que extraer cambios incrementales — los datos están todos en un CSV. Implementar CDC sobre datos estáticos sería forzado y no demostraría nada nuevo. El batch actual:
+Porque el **dataset disponible es histórico y estático** (~1.2 GB de transacciones 2010-2019). No hay un sistema productivo del que extraer cambios incrementales — los datos están todos en un CSV. Implementar CDC sobre datos estáticos sería forzado y no demostraría nada nuevo. El batch actual:
 
-- Demuestra todo el ciclo de un pipeline ETL bien diseñado (8 pasos del material 7.1)
+- Demuestra todo el ciclo de un pipeline ETL bien diseñado (8 pasos del framework)
 - Procesa el volumen real (13 M filas) con buena performance (Polars + DuckDB + COPY)
 - Produce las mismas métricas que tendría el sistema en producción
 - **Tiene una migración bien definida a tiempo real en dos etapas** (esta sección lo demuestra)
@@ -660,10 +660,70 @@ La transición es **incremental, no destructiva**: la lógica de negocio (reglas
 
 ---
 
-## Referencias
+## Apéndice: trazabilidad académica
 
-- Material 7.1 – Fundamentos de ETL y Pipelines
-- Material 7.2 – ETL Avanzado: Estrategias de Ingesta y Calidad
-- Material 7.3 – Orquestación de Datos
-- Material 7.4 – Apache Airflow: Orquestación Profesional
-- Proyecto ejemplo: Black Friday (estructura, contrato del DAG, idempotencia)
+> Esta sección está pensada para la evaluación de la cátedra. Si solo necesitás
+> usar o desarrollar SecureLink, podés saltearla — el cuerpo del README ya cubre
+> todo lo necesario para trabajar con el producto.
+
+### Material del curso aplicado al proyecto
+
+- **7.1 — Fundamentos de ETL y Pipelines**: framework de 8 pasos (objetivo, fuentes, estrategia de ingesta, procesamiento, almacenamiento, flujo, gobernanza, consumo). Aplicado en la sección [Los 8 pasos del pipeline aplicados a SecureLink](#los-8-pasos-del-pipeline-aplicados-a-securelink).
+- **7.2 — ETL Avanzado (Estrategias de Ingesta y Calidad)**: ingesta en batch por chunks, formato columnar (Parquet), control de calidad con validaciones explícitas. Aplicado en `_ingest_transactions`, `_transform_data` y `_quality_check`.
+- **7.3 — Orquestación de Datos**: DAG con dependencias explícitas (`>>`), tareas paralelas, retries con backoff exponencial, idempotencia.
+- **7.4 — Apache Airflow (Orquestación Profesional)**: `PostgresHook` + `PostgresOperator`, `LocalExecutor`, `default_args`, gestión de credenciales por variables de entorno (nota sobre secretos productivos en sección Decisiones técnicas).
+
+### Relación con el proyecto ejemplo Black Friday
+
+SecureLink usa el mismo **esqueleto canónico** del ejemplo en tres dimensiones:
+
+**1. Estructura del DAG**
+- Patrón `validate → extract/load_refs → transform → load → quality_check` (idéntico al de Black Friday `validate → extract → transform → load → quality_check`)
+- `default_args` con `retries=3` + `retry_exponential_backoff=True`
+- Validación de conectividad al DWH antes de procesar (`validate_dwh` con `SELECT 1`)
+- `quality_check` final que tira excepción si hay datos inválidos
+- Tareas paralelas con `[t1, t2] >> t3`
+- Una función `_funcion()` por tarea (convención de prefijo guión bajo)
+- Logging por tarea con `logging.getLogger(__name__)`
+
+**2. Infraestructura Docker**
+- Mismo esqueleto del `docker-compose.yml`: `postgres-airflow` (metadata) + `postgres-dwh` (DWH) + `airflow-init` (migración + admin user) + `airflow-scheduler` + `airflow-webserver`
+- Mismas convenciones: health checks con `pg_isready`, volúmenes `./dags`, `./logs`, `./data`, `depends_on` con `condition: service_healthy`
+- Mismas variables de entorno de Airflow (`LocalExecutor`, `FERNET_KEY`, `LOAD_EXAMPLES=False`, `DAGS_ARE_PAUSED_AT_CREATION=True`, `BASIC_AUTH`)
+- `Dockerfile.airflow` parte del mismo template (`apache/airflow:2.7.3-python3.11` + constraints URL + mismas dependencias base)
+
+**3. Filosofía de idempotencia**
+- El ejemplo usa `ON CONFLICT DO UPDATE` (UPSERT) porque cada corrida agrega pocas filas
+- SecureLink usa `TRUNCATE + COPY` atómico (refresh completo) porque cada corrida reemplaza 13M filas. Diferente patrón, mismo objetivo: que reejecutar el DAG no rompa el dashboard ni duplique datos
+
+### Diferencias respecto al ejemplo (con justificación)
+
+| Aspecto | Black Friday | SecureLink | Por qué difiere |
+|---|---|---|---|
+| **Schedule** | `*/1 * * * *` (cada minuto) | `@daily` | Datos en vivo vs dataset histórico estático |
+| **Fuentes** | PostgreSQL + API REST | 3 CSV + 2 JSON | El cliente entrega dataset histórico, no sistemas productivos |
+| **Estrategia ingesta** | CDC incremental (`last_updated`) | Full refresh | Dataset estático: no hay cambios incrementales que capturar |
+| **Volumen por corrida** | Decenas de filas | 13 M filas | Ordenes de magnitud distintas |
+| **Engine** | pandas | Polars + DuckDB | El volumen masivo necesita engines optimizados (pandas es single-thread) |
+| **Comunicación entre tareas** | XCom | Parquet/pickle en `/tmp` | XCom serializa en la metadata DB; 13M filas la rompen |
+| **Carga al DWH** | `INSERT ON CONFLICT DO UPDATE` | `TRUNCATE + COPY` | UPSERT es lento con 13M filas; full refresh atómico es más eficiente |
+| **Servicios extras** | `postgres-source` + `api-sales` | (ninguno) | Las fuentes son archivos, no sistemas externos |
+| **Dashboard / BI** | Metabase (tool genérico) | Streamlit (custom) | Quisimos un dashboard con narrativa propia (4 reglas, datasets, recomendaciones) |
+| **Webserver Airflow** | Config estándar | Worker `gevent` + timeouts extendidos | Para máquinas del equipo con RAM limitada (4-6 GB) |
+| **Dependencias del Dockerfile** | + `polars` + `pyarrow` (preinstaladas por el profe) | + `polars` + `duckdb` + `gevent` | Usamos las que ya venían + agregamos las que necesitábamos |
+
+### Cumplimiento del SRS
+
+- **SRS sección 1 (objetivos)**: detección de fraude en transacciones financieras → implementado con las 4 reglas heurísticas
+- **SRS sección 2.b (interfaces de usuario)**: dashboard analítico → Streamlit con 4 paneles (General, Usuario, Comercios, Datasets)
+- **SRS sección 2.d (evolución previsible)**: detección en tiempo real, modelo ML, alertas → documentado el diseño en la sección [Evolución a tiempo real](#evolución-a-tiempo-real) (no implementado en el MVP)
+- **SRS sección 2.c (interfaces de hardware)**: cualquier PC con navegador web actualizado → cumplido (todo corre en Docker, único requisito es Docker Desktop)
+
+---
+
+## Referencias técnicas externas
+
+- Apache Airflow docs: https://airflow.apache.org/docs/
+- Polars docs: https://docs.pola.rs/
+- DuckDB docs: https://duckdb.org/docs/
+- PostgreSQL COPY: https://www.postgresql.org/docs/current/sql-copy.html
