@@ -366,7 +366,9 @@ def _compute_metrics(**context):
     logger.info(f"  Tasa de fraude: {metrics_global['fraud_rate']:.2%}")
     logger.info(f"  Monto en riesgo: ${metrics_global['total_amount_at_risk']:,.2f}")
 
-    # ── Helpers ──
+    # ── Helper: usa GROUP BY ALL (sintaxis DuckDB) para evitar repetir las
+    # expresiones del SELECT en el GROUP BY. ALL agrupa por todas las columnas
+    # no-agregadas del SELECT automáticamente.
     def agg_query(group_cols, where=""):
         return f"""
             SELECT {group_cols},
@@ -376,7 +378,7 @@ def _compute_metrics(**context):
                 COALESCE(SUM(CASE WHEN is_fraud THEN amount END), 0)    AS amount_at_risk
             FROM read_parquet('{parquet}')
             {where}
-            GROUP BY {group_cols}
+            GROUP BY ALL
         """
 
     # ── By MCC ──
@@ -466,10 +468,17 @@ def _load_to_dwh(**context):
     # más rápido para bulk load. Sigue garantizando ACID al final del COMMIT.
     cur.execute("SET LOCAL synchronous_commit = OFF")
 
-    # ── transactions_processed via COPY a staging + INSERT ON CONFLICT ──
-    # Patrón: COPY a una tabla temporal (UNLOGGED, sin PK) y luego INSERT INTO ...
-    # SELECT FROM staging ON CONFLICT DO NOTHING. Esto da lo mejor de dos mundos:
-    # velocidad de COPY + idempotencia ante duplicados en el source.
+    # ── transactions_processed: COPY directo a la tabla final ──
+    # Optimizaciones:
+    # 1. pl.scan_parquet (lazy) + sink_csv (streaming) en lugar de read_parquet +
+    #    write_csv. La versión eager cargaba 763 MB de parquet como ~3 GB en RAM,
+    #    forzaba swap en máquinas con poca RAM y tardaba 30+ min.
+    # 2. COPY directo a transactions_processed (sin staging table + DISTINCT ON +
+    #    ON CONFLICT). Ese patrón tardaba 30+ min por el sort y el chequeo del
+    #    índice único. transaction_id es PK del CSV de origen → no hay duplicados,
+    #    el DISTINCT ON + ON CONFLICT era defensa innecesaria. TRUNCATE+COPY es
+    #    atómico dentro de la transacción (PostgreSQL MVCC), así que el dashboard
+    #    sigue viendo los datos viejos hasta el COMMIT final.
     logger.info("  Preparando CSV para COPY...")
 
     columns_in_order = [
@@ -481,46 +490,35 @@ def _load_to_dwh(**context):
         "distance_km", "is_fraud", "is_suspicious", "suspicion_reasons",
     ]
 
-    # Crear tabla de staging temporal (vive solo durante la transacción)
-    cur.execute("""
-        CREATE TEMP TABLE _stg_transactions (
-            LIKE transactions_processed INCLUDING DEFAULTS
-        ) ON COMMIT DROP
-    """)
-    # En la staging quitamos el PK para que COPY no falle si hay dupes
-    cur.execute("ALTER TABLE _stg_transactions DROP CONSTRAINT IF EXISTS _stg_transactions_pkey")
+    # Ver qué columnas existen en el parquet para agregar las faltantes como NULL
+    parquet_cols = set(pl.scan_parquet(PROCESSED_PATH).schema.keys())
 
-    df = pl.read_parquet(PROCESSED_PATH)
-    # Garantizar que estén todas las columnas (user_state no existe en el dataset, se rellena con NULL)
-    for col in columns_in_order:
-        if col not in df.columns:
-            df = df.with_columns(pl.lit(None).alias(col))
-    df_copy = df.select(columns_in_order)
+    # Lazy plan: selecciono solo las columnas necesarias, agrego las faltantes
+    # como literal null. Polars hace sink_csv en streaming (no carga todo en RAM)
+    lazy_df = pl.scan_parquet(PROCESSED_PATH)
+    select_exprs = [
+        pl.col(c) if c in parquet_cols else pl.lit(None).alias(c)
+        for c in columns_in_order
+    ]
+    lazy_df.select(select_exprs).sink_csv(
+        COPY_CSV_PATH,
+        include_header=False,
+        null_value="",
+    )
+    logger.info(f"  CSV escrito → {COPY_CSV_PATH}. Ejecutando COPY...")
 
-    # Polars escribe el CSV en streaming, muy rápido
-    df_copy.write_csv(COPY_CSV_PATH, include_header=False, null_value="")
-    total_rows = df_copy.height
-    logger.info(f"  CSV escrito ({total_rows:,} filas). Ejecutando COPY...")
-
+    # COPY directo a la tabla final
+    cur.execute("TRUNCATE TABLE transactions_processed")
     with open(COPY_CSV_PATH, "r") as f:
         cur.copy_expert(
-            f"COPY _stg_transactions ({', '.join(columns_in_order)}) "
+            f"COPY transactions_processed ({', '.join(columns_in_order)}) "
             f"FROM STDIN WITH (FORMAT CSV, NULL '')",
             f
         )
     os.remove(COPY_CSV_PATH)
-    logger.info(f"  COPY a staging completado: {total_rows:,} filas")
-
-    # Mover de staging a la tabla final con dedup vía ON CONFLICT
-    cur.execute("TRUNCATE TABLE transactions_processed")
-    cur.execute(f"""
-        INSERT INTO transactions_processed ({', '.join(columns_in_order)})
-        SELECT DISTINCT ON (transaction_id) {', '.join(columns_in_order)}
-        FROM _stg_transactions
-        ON CONFLICT (transaction_id) DO NOTHING
-    """)
-    final_count = cur.rowcount
-    logger.info(f"  Insertadas en transactions_processed: {final_count:,} filas")
+    # cur.rowcount tras COPY trae las filas insertadas
+    total_rows = cur.rowcount
+    logger.info(f"  COPY completado: {total_rows:,} filas en transactions_processed")
 
     # ── Métricas globales ──
     g = metrics["global"]
