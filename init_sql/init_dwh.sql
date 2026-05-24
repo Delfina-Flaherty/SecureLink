@@ -157,7 +157,30 @@ CREATE TABLE IF NOT EXISTS pipeline_run_log (
     notes           TEXT
 );
 
+-- -------------------------------------------------------
+-- ÍNDICES para acelerar las queries del dashboard
+-- -------------------------------------------------------
+-- Sin estos índices, queries que filtran por user_id o agrupan por
+-- transaction_type/is_fraud hacen Seq Scan sobre 13M filas y tardan
+-- decenas de segundos. Con los índices, las queries del Panel de
+-- Usuario y Panel de Comercios pasan de ~30s a ~2-3s.
+--
+-- NOTA: este archivo solo se ejecuta cuando el DWH se crea por
+-- primera vez (volumen vacío). Si ya tenés el DWH con datos y querés
+-- crear los índices, ejecutá manualmente:
+--     docker exec postgres-dwh psql -U dwh -d securelink -f /docker-entrypoint-initdb.d/01_init.sql
+-- o copiá los CREATE INDEX de abajo y ejecutalos uno por uno.
+
+CREATE INDEX IF NOT EXISTS idx_txn_date      ON transactions_processed (transaction_date);
+CREATE INDEX IF NOT EXISTS idx_txn_user_id   ON transactions_processed (user_id);
+CREATE INDEX IF NOT EXISTS idx_txn_is_fraud  ON transactions_processed (is_fraud);
+CREATE INDEX IF NOT EXISTS idx_txn_type      ON transactions_processed (transaction_type);
+CREATE INDEX IF NOT EXISTS idx_txn_merchant  ON transactions_processed (merchant_id);
+-- Índice compuesto para el Panel de Usuario: "últimas N transacciones del usuario"
+-- (filtro por user_id + orden por fecha desc)
+CREATE INDEX IF NOT EXISTS idx_txn_user_date ON transactions_processed (user_id, transaction_date DESC);
+
 -- Mensaje de confirmación
 DO $$ BEGIN
-    RAISE NOTICE 'SecureLink DWH inicializado correctamente.';
+    RAISE NOTICE 'SecureLink DWH inicializado correctamente (con índices).';
 END $$;
