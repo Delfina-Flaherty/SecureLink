@@ -65,7 +65,7 @@ def _validate_files(**context):
         logger.info(f"  ✓ {os.path.basename(filepath)} existe")
 
     # Verificar columnas mínimas
-    txn = pd.read_csv(TRANSACTIONS_FILE, nrows=1, sep=',')
+    txn = pd.read_csv(TRANSACTIONS_FILE, sep=None, engine='python')
     for col in ['id', 'date', 'client_id', 'card_id', 'amount', 'use_chip', 'merchant_id', 'mcc']:
         if col not in txn.columns:
             raise ValueError(f"transactions_data.csv no tiene la columna '{col}'. Columnas: {list(txn.columns)}")
@@ -173,7 +173,7 @@ def _ingest_transactions(**context):
 
     # ── Pipeline lazy: scan CSV → 4 joins → sink parquet (streaming) ──
     result = (
-        pl.scan_csv(TRANSACTIONS_FILE, separator=",", infer_schema_length=10_000,
+        pl.scan_csv(TRANSACTIONS_FILE, separator=";", infer_schema_length=10_000,
                     ignore_errors=True)
         .rename({"id": "transaction_id"})
         .with_columns([
@@ -217,7 +217,7 @@ def _transform_data(**context):
     df = (
         df
         .with_columns([
-            pl.col("date").str.to_datetime(strict=False).alias("transaction_date"),
+            pl.col("date").str.to_datetime(format="%m/%d/%Y %H:%M",strict=False).alias("transaction_date"),
             pl.col("amount").cast(pl.Utf8)
                 .str.replace_all("$", "", literal=True)
                 .str.replace_all(",", "", literal=True)
