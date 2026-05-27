@@ -64,8 +64,8 @@ def _validate_files(**context):
             )
         logger.info(f"  ✓ {os.path.basename(filepath)} existe")
 
-    # Verificar columnas mínimas
-    txn = pd.read_csv(TRANSACTIONS_FILE, sep=None, engine='python')
+    # Verificar columnas mínimas (nrows=1 para no leer el CSV entero, solo el header)
+    txn = pd.read_csv(TRANSACTIONS_FILE, nrows=1, sep=None, engine='python')
     for col in ['id', 'date', 'client_id', 'card_id', 'amount', 'use_chip', 'merchant_id', 'mcc']:
         if col not in txn.columns:
             raise ValueError(f"transactions_data.csv no tiene la columna '{col}'. Columnas: {list(txn.columns)}")
@@ -135,12 +135,29 @@ def _load_labels(**context):
 # ============================================================
 # TAREA 3: Ingesta + unión con fuentes de referencia (Polars)
 # ============================================================
+def _detect_csv_separator(filepath, sample_size=8192):
+    """Detecta el separador del CSV leyendo los primeros 8KB.
+    Soporta coma, punto-y-coma, tab y pipe. Si falla, asume coma por defecto."""
+    import csv as _csv
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        sample = f.read(sample_size)
+    try:
+        dialect = _csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        return dialect.delimiter
+    except _csv.Error:
+        return ","
+
+
 def _ingest_transactions(**context):
     """Lee transactions_data.csv y enriquece con las 4 fuentes de referencia.
     Usa Polars con scan/sink (lazy + streaming) para procesar 13M filas en
     una sola pasada paralelizada en todos los cores del CPU."""
     logger.info("=== TAREA 3: Ingesta y unión de transacciones (Polars) ===")
     import polars as pl
+
+    # ── Detectar separador del CSV (',' o ';' u otro) ──
+    sep = _detect_csv_separator(TRANSACTIONS_FILE)
+    logger.info(f"  Separador detectado: {sep!r}")
 
     # ── Cargar referencias (datos chicos) ──
     users = pl.read_parquet(REF_USERS_PATH)
@@ -173,7 +190,7 @@ def _ingest_transactions(**context):
 
     # ── Pipeline lazy: scan CSV → 4 joins → sink parquet (streaming) ──
     result = (
-        pl.scan_csv(TRANSACTIONS_FILE, separator=";", infer_schema_length=10_000,
+        pl.scan_csv(TRANSACTIONS_FILE, separator=sep, infer_schema_length=10_000,
                     ignore_errors=True)
         .rename({"id": "transaction_id"})
         .with_columns([
@@ -214,10 +231,21 @@ def _transform_data(**context):
     df = pl.scan_parquet(MERGED_PATH)
 
     # ── Limpieza ──
+    # Parser de fechas robusto: intenta varios formatos comunes en orden, usa el
+    # primero que no devuelve null. Soporta ISO ("2010-01-15 14:30:00"), US
+    # ("01/15/2010 14:30") y otros frecuentes. Si ninguno matchea, devuelve null
+    # y la fila se descarta en el filtro de abajo.
     df = (
         df
         .with_columns([
-            pl.col("date").str.to_datetime(format="%m/%d/%Y %H:%M",strict=False).alias("transaction_date"),
+            pl.coalesce([
+                pl.col("date").str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False),
+                pl.col("date").str.to_datetime("%Y-%m-%d", strict=False),
+                pl.col("date").str.to_datetime("%m/%d/%Y %H:%M", strict=False),
+                pl.col("date").str.to_datetime("%m/%d/%Y", strict=False),
+                pl.col("date").str.to_datetime("%d/%m/%Y %H:%M", strict=False),
+                pl.col("date").str.to_datetime("%d/%m/%Y", strict=False),
+            ]).alias("transaction_date"),
             pl.col("amount").cast(pl.Utf8)
                 .str.replace_all("$", "", literal=True)
                 .str.replace_all(",", "", literal=True)
