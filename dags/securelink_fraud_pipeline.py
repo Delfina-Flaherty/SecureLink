@@ -224,17 +224,22 @@ def _ingest_transactions(**context):
 # ============================================================
 def _transform_data(**context):
     """Combina las 3 transformaciones (clean, features, rules) en una sola pasada
-    Polars sobre el parquet. Reduce I/O en ~60% vs hacer 3 tareas separadas."""
+    Polars sobre el parquet. Reduce I/O en ~60% vs hacer 3 tareas separadas.
+    
+    Reglas de detección:
+    R1 - Monto atípico por usuario: supera el p99 de ese usuario específico
+    R2 - Error en la transacción: la columna errors tiene algún valor
+    R3 - Tarjeta en dark web: card_on_dark_web = True
+    R4 - Alto endeudamiento: deuda > 3x ingreso anual
+    R5 - Horario inusual: la hora de la transacción representa menos del 1%
+         del historial de ese usuario (o nunca operó en esa hora)
+    """
     logger.info("=== TAREA 4: Limpieza + Features + Reglas (Polars) ===")
     import polars as pl
 
     df = pl.scan_parquet(MERGED_PATH)
 
     # ── Limpieza ──
-    # Parser de fechas robusto: intenta varios formatos comunes en orden, usa el
-    # primero que no devuelve null. Soporta ISO ("2010-01-15 14:30:00"), US
-    # ("01/15/2010 14:30") y otros frecuentes. Si ninguno matchea, devuelve null
-    # y la fila se descarta en el filtro de abajo.
     df = (
         df
         .with_columns([
@@ -257,7 +262,6 @@ def _transform_data(**context):
                 .is_in(["YES", "TRUE", "1"]).alias("card_on_dark_web"),
         ])
         .with_columns([
-            # Limpiar columnas monetarias del usuario/tarjeta (vienen como strings con $)
             pl.col("credit_limit").cast(pl.Utf8)
                 .str.replace_all("$", "", literal=True)
                 .str.replace_all(",", "", literal=True)
@@ -276,11 +280,6 @@ def _transform_data(**context):
             & pl.col("amount").is_not_null()
             & pl.col("transaction_date").is_not_null()
         )
-        # Nota: NO se hace .unique(subset="transaction_id") porque rompe el streaming
-        # de Polars (requeriría materializar 13M transaction_ids en un hashset → OOM
-        # en máquinas con 4 GB de RAM). transaction_id es PK del CSV de origen, no
-        # debería haber duplicados. Si los hubiera, los maneja `INSERT ... ON CONFLICT
-        # DO NOTHING` del staging del load_to_dwh.
     )
 
     # ── Features derivadas ──
@@ -292,6 +291,8 @@ def _transform_data(**context):
             .otherwise(None)
             .alias("debt_income_ratio"),
         pl.lit(None).cast(pl.Float64).alias("distance_km"),
+        # Hora de la transacción — necesaria para R5
+        pl.col("transaction_date").dt.hour().alias("hour"),
     ]).with_columns([
         pl.when(pl.col("is_online"))
             .then(pl.lit("Online"))
@@ -299,47 +300,102 @@ def _transform_data(**context):
             .alias("transaction_type"),
     ])
 
-    # ── Umbral p99 del monto (necesario para Regla 1) ──
-    # Polars ejecuta el plan lazy hasta acá para sacar el p99.
-    # Después vuelve a ejecutarlo para aplicar las reglas. Son 2 pasadas del
-    # parquet, pero ambas streaming y paralelas, mucho más rápido que pandas.
-    p99 = df.select(pl.col("amount").quantile(0.99)).collect().item()
-    logger.info(f"  Umbral monto alto (p99): ${p99:,.2f}")
+    # ── Materializar para calcular perfiles por usuario ──
+    # Necesitamos collect() acá porque los cálculos de p99 por usuario y
+    # distribución de horarios requieren ver TODAS las filas de un usuario
+    # juntas. Polars no puede hacer eso en modo lazy/streaming porque procesa
+    # por bloques y no tiene todas las filas del usuario en memoria a la vez.
+    # Es la única materialización del pipeline — después volvemos a lazy.
+    logger.info("  Materializando para calcular perfiles de usuario...")
+    df_collected = df.collect()
+    logger.info(f"  Filas después de limpieza: {len(df_collected):,}")
+
+    # ── R1: p99 de monto por usuario ──
+    # Para cada usuario, calculamos el monto que supera al 99% de sus compras.
+    # Una transacción que supere ESE umbral (no el global) es atípica para él.
+    logger.info("  Calculando p99 de monto por usuario...")
+    p99_por_usuario = (
+        df_collected
+        .group_by("user_id")
+        .agg(pl.col("amount").quantile(0.99).alias("p99_amount"))
+    )
+    # Cuántos usuarios tienen perfil de monto
+    logger.info(f"  Perfiles de monto calculados: {len(p99_por_usuario):,} usuarios")
+
+    # ── R5: perfil de horarios por usuario ──
+    # Contamos cuántas transacciones tiene cada usuario en cada hora del día.
+    # Si en cierta hora tiene menos del 1% de su actividad total → hora inusual.
+    logger.info("  Calculando perfil de horarios por usuario...")
+    hour_counts = (
+        df_collected
+        .group_by(["user_id", "hour"])
+        .agg(pl.len().alias("txn_in_hour"))
+    )
+    user_totals = (
+        df_collected
+        .group_by("user_id")
+        .agg(pl.len().alias("total_txn_user"))
+    )
+    hour_profile = (
+        hour_counts
+        .join(user_totals, on="user_id", how="left")
+        .with_columns(
+            (pl.col("txn_in_hour") / pl.col("total_txn_user")).alias("hour_ratio")
+        )
+        .select(["user_id", "hour", "hour_ratio"])
+    )
+    logger.info(f"  Perfiles de horario calculados: {len(hour_profile):,} combinaciones usuario-hora")
+
+    # ── Unir perfiles al dataframe principal ──
+    df_with_profiles = (
+        df_collected
+        .join(p99_por_usuario, on="user_id", how="left")
+        .join(hour_profile, on=["user_id", "hour"], how="left")
+    )
 
     # ── Reglas de detección ──
+    # Nota: fill_null(True) en R5 porque si un usuario nunca operó en esa hora,
+    # hour_ratio es null → eso es aún más sospechoso que operar poco en esa hora.
     final = (
-        df
+        df_with_profiles
         .with_columns([
-            (pl.col("amount") > p99).alias("_r1"),
+            # R1: monto supera el p99 de ESE usuario (antes era el p99 global)
+            (pl.col("amount") > pl.col("p99_amount"))
+                .fill_null(False).alias("_r1"),
+            # R2: sin cambios
             (
                 pl.col("errors").is_not_null()
                 & (pl.col("errors").cast(pl.Utf8).str.strip_chars() != "")
                 & (pl.col("errors").cast(pl.Utf8).str.strip_chars() != "nan")
             ).alias("_r2"),
+            # R3: sin cambios
             pl.col("card_on_dark_web").fill_null(False).alias("_r3"),
+            # R4: sin cambios
             (pl.col("debt_income_ratio") > 3).fill_null(False).alias("_r4"),
+            # R5: hora inusual para ese usuario
+            # fill_null(True) → si nunca operó en esa hora, es sospechoso
+            (pl.col("hour_ratio") < 0.01).fill_null(True).alias("_r5"),
         ])
         .with_columns([
-            (pl.col("_r1") | pl.col("_r2") | pl.col("_r3") | pl.col("_r4"))
+            (pl.col("_r1") | pl.col("_r2") | pl.col("_r3") | pl.col("_r4") | pl.col("_r5"))
                 .alias("is_suspicious"),
             pl.concat_str([
-                pl.when(pl.col("_r1")).then(pl.lit("monto_atipico;")).otherwise(pl.lit("")),
+                pl.when(pl.col("_r1")).then(pl.lit("monto_atipico_usuario;")).otherwise(pl.lit("")),
                 pl.when(pl.col("_r2")).then(pl.lit("error_en_transaccion;")).otherwise(pl.lit("")),
                 pl.when(pl.col("_r3")).then(pl.lit("tarjeta_en_dark_web;")).otherwise(pl.lit("")),
                 pl.when(pl.col("_r4")).then(pl.lit("alto_endeudamiento;")).otherwise(pl.lit("")),
+                pl.when(pl.col("_r5")).then(pl.lit("horario_inusual;")).otherwise(pl.lit("")),
             ]).str.strip_chars_end(";").alias("suspicion_reasons"),
         ])
-        .drop(["_r1", "_r2", "_r3", "_r4"])
-        # Rename columns para que coincidan con el schema del DWH
+        .drop(["_r1", "_r2", "_r3", "_r4", "_r5", "hour", "p99_amount", "hour_ratio"])
         .rename({
             "current_age": "user_age",
             "gender": "user_gender",
         })
     )
 
-    final.sink_parquet(PROCESSED_PATH, compression="snappy")
+    final.write_parquet(PROCESSED_PATH, compression="snappy")
     logger.info(f"Transformaciones completadas → {PROCESSED_PATH}")
-
 
 # ============================================================
 # TAREA 5: Calcular métricas (DuckDB)
@@ -365,7 +421,9 @@ def _compute_metrics(**context):
                 COUNT(*) FILTER (WHERE is_suspicious AND NOT is_fraud) AS fp_count,
                 COUNT(*) FILTER (WHERE NOT is_suspicious AND is_fraud) AS fn_count,
                 MIN(transaction_date)::DATE AS start_dt,
-                MAX(transaction_date)::DATE AS end_dt
+                MAX(transaction_date)::DATE AS end_dt,
+                COUNT(*) FILTER (WHERE is_suspicious AND is_fraud) AS tp_count,
+                COUNT(*) FILTER (WHERE NOT is_suspicious AND NOT is_fraud) AS tn_count,
             FROM read_parquet('{parquet}')
         )
         SELECT
@@ -376,21 +434,30 @@ def _compute_metrics(**context):
             amount_at_risk / NULLIF(total_fraud, 0)                  AS avg_fraud_amount,
             CAST(fp_count AS DOUBLE) / NULLIF(total_legit, 0)        AS fpr,
             CAST(fn_count AS DOUBLE) / NULLIF(total_fraud, 0)        AS fnr,
+            tp_count,
+            tn_count,
+            fp_count,
+            fn_count,
             start_dt, end_dt
         FROM base
     """).fetchone()
-
+   
     metrics_global = {
-        "total_transactions": int(g_row[0]),
-        "total_fraud": int(g_row[1]),
-        "fraud_rate": float(g_row[2] or 0),
-        "total_amount_at_risk": float(g_row[3] or 0),
-        "avg_fraud_amount": float(g_row[4] or 0),
-        "false_positive_rate": float(g_row[5] or 0),
-        "false_negative_rate": float(g_row[6] or 0),
-        "dataset_start_date": g_row[7],
-        "dataset_end_date": g_row[8],
+        "total_transactions":    int(g_row[0]),
+        "total_fraud":           int(g_row[1]),
+        "fraud_rate":            float(g_row[2] or 0),
+        "total_amount_at_risk":  float(g_row[3] or 0),
+        "avg_fraud_amount":      float(g_row[4] or 0),
+        "false_positive_rate":   float(g_row[5] or 0),
+        "false_negative_rate":   float(g_row[6] or 0),
+        "true_positives":        int(g_row[7]),
+        "true_negatives":        int(g_row[8]),
+        "false_positives":       int(g_row[9]),
+        "false_negatives":       int(g_row[10]),
+        "dataset_start_date":    g_row[11],
+        "dataset_end_date":      g_row[12],
     }
+   
     logger.info(f"  Tasa de fraude: {metrics_global['fraud_rate']:.2%}")
     logger.info(f"  Monto en riesgo: ${metrics_global['total_amount_at_risk']:,.2f}")
 
