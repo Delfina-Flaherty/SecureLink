@@ -114,20 +114,22 @@ if pagina == "Panel General":
 
         st.divider()
 
-        st.header("⚖️ Las 4 reglas de detección de fraude")
+        st.header("⚖️ Las 5 reglas de detección de fraude")
         st.markdown(
             "El pipeline marca una transacción como **sospechosa** (`is_suspicious = True`) "
-            "cuando **al menos una** de estas 4 reglas se cumple (OR lógico). La columna "
+            "cuando **al menos una** de estas 5 reglas se cumple (OR lógico). La columna "
             "`suspicion_reasons` indica qué reglas dispararon la marca."
         )
         col1, col2 = st.columns(2)
         with col1:
             st.markdown(
-                "##### 1️⃣ Monto atípico (`monto_atipico`)\n"
-                "**Condición:** `amount > percentil 99` del dataset.\n\n"
-                "**Por qué:** las transacciones del 1% superior en monto son raras "
-                "y muchas veces corresponden a intentos de fraude con compras grandes "
-                "antes de que la tarjeta sea bloqueada."
+                "##### 1️⃣ Monto atípico por usuario (`monto_atipico_usuario`)\n"
+                "**Condición:** `amount > percentil 99` del historial de ESE usuario.\n\n"
+                "**Por qué:** en lugar de comparar contra un umbral global del dataset, "
+                "cada transacción se compara contra el comportamiento histórico del propio titular. "
+                "Un monto de $500 puede ser completamente normal para un usuario y altamente "
+                "atípico para otro. Esto reduce los falsos positivos en usuarios de alto poder "
+                "adquisitivo y mejora la sensibilidad en usuarios de gasto bajo."
             )
             st.markdown(
                 "##### 3️⃣ Tarjeta en dark web (`tarjeta_en_dark_web`)\n"
@@ -135,6 +137,17 @@ if pagina == "Panel General":
                 "**Por qué:** si el número de tarjeta circula en la dark web (red oscura, "
                 "sitios no indexados donde se venden datos robados), cualquier transacción "
                 "con esa tarjeta tiene riesgo elevado."
+            )
+            st.markdown(
+                "##### 5️⃣ Horario inusual para el usuario (`horario_inusual`)\n"
+                "**Condición:** la hora de la transacción representa menos del 1% del "
+                "historial de transacciones de ese usuario. Si nunca operó en esa hora, "
+                "también se marca.\n\n"
+                "**Por qué:** cada persona tiene patrones horarios habituales de consumo. "
+                "Una compra a las 3 AM de alguien que históricamente solo opera entre las "
+                "9 AM y las 10 PM es una señal de alerta — puede indicar que otra persona "
+                "está usando la tarjeta. Esta regla no aplica un horario fijo para todos, "
+                "sino que aprende el patrón individual de cada usuario."
             )
         with col2:
             st.markdown(
@@ -153,9 +166,12 @@ if pagina == "Panel General":
             )
         st.info(
             "💡 **Limitación reconocida:** son reglas heurísticas (basadas en intuición de dominio), "
-            "no un modelo de Machine Learning (aprendizaje automático). La evolución prevista es "
-            "entrenar un modelo con `train_fraud_labels.json` (verdad de referencia / ground truth) "
-            "y reemplazar estas reglas por un puntaje probabilístico."
+            "no un modelo de Machine Learning (aprendizaje automático). Las reglas 1 y 5 se calculan "
+            "sobre el historial completo del dataset — en un sistema productivo, el perfil de cada "
+            "usuario se calcularía solo con transacciones verificadas como legítimas y se actualizaría "
+            "con cada nueva transacción. La evolución prevista es entrenar un modelo con "
+            "`train_fraud_labels.json` (verdad de referencia / ground truth) y reemplazar estas "
+            "reglas por un puntaje probabilístico."
         )
 
         st.divider()
@@ -407,7 +423,7 @@ if pagina == "Panel General":
                 st.plotly_chart(fig, use_container_width=True)
 
             st.divider()
-            st.subheader("🎯 Matriz de confusión de las 4 reglas")
+            st.subheader("🎯 Matriz de confusión de las 5 reglas")
             st.caption("Cruza predicción (regla) vs realidad (etiqueta). Definiciones de TP/FP/FN/TN en la pestaña Explicaciones.")
             confusion = query("""
                 SELECT
