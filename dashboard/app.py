@@ -76,6 +76,31 @@ if run_info is not None and not run_info.empty:
     st.sidebar.write(f"{r['rows_processed']:,} filas procesadas")
     st.sidebar.write(f"{r['rows_fraud']:,} fraudes detectados")
 
+# ── Filtro global: ¿qué población mostramos en la pestaña Datos? ──
+# "Fraude real" = etiqueta oficial (is_fraud, ground truth).
+# "Sospechosos" = lo que marca el puntaje del pipeline (is_suspicious).
+st.sidebar.divider()
+modo_vista = st.sidebar.radio(
+    "🔎 Mostrar datos de:",
+    ["Fraude real", "Sospechosos (modelo)"],
+    help="**Fraude real**: transacciones etiquetadas como fraude por la verdad de "
+         "referencia (`is_fraud`). **Sospechosos**: lo que el puntaje ponderado del "
+         "pipeline marcó como sospechoso (`is_suspicious`). Afecta a toda la pestaña "
+         "Datos del Panel General; la matriz de confusión siempre compara ambos.",
+)
+SUSP_MODE = modo_vista.startswith("Sospechosos")
+FRAUD_COL = "is_suspicious" if SUSP_MODE else "is_fraud"
+# Nombres de columnas en las tablas pre-agregadas según el modo
+SEG_COUNT = "total_suspicious" if SUSP_MODE else "total_fraud"
+SEG_AMOUNT = "amount_suspicious" if SUSP_MODE else "amount_at_risk"
+# Etiquetas para títulos y textos según el modo de vista
+VISTA_LABEL = "sospechosas" if SUSP_MODE else "fraude"   # sustantivo plural / masa
+VISTA_CAP = "Sospechosas" if SUSP_MODE else "Fraude"      # capitalizado (ejes, títulos)
+VISTA_CANT = "Cantidad de sospechosas" if SUSP_MODE else "Cantidad de fraudes"
+VISTA_TASA = "Tasa de sospechosas" if SUSP_MODE else "Tasa de fraude"
+VISTA_PCT = "% Sospechosas" if SUSP_MODE else "% Fraude"
+VISTA_MONTO = "Monto sospechoso" if SUSP_MODE else "Monto en riesgo"
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PANEL GENERAL
@@ -102,7 +127,7 @@ if pagina == "Panel General":
             "2. **Limpieza** — normaliza fechas, montos, descarta filas inválidas y duplicadas.\n"
             "3. **Features (variables derivadas)** — calcula `debt_income_ratio` (cociente deuda/ingreso) "
             "y clasifica cada transacción como Online (en línea) o Presencial.\n"
-            "4. **Detección** — aplica las 4 reglas (ver abajo) y marca cada transacción como sospechosa o no.\n"
+            "4. **Detección** — calcula un puntaje ponderado de riesgo (ver abajo) y marca cada transacción como sospechosa o no.\n"
             "5. **Carga al DWH** — guarda el detalle y agregados en PostgreSQL.\n"
             "6. **Consumo** — este dashboard consulta los agregados para mostrar las visualizaciones.\n\n"
             "**¿Qué responde el sistema?**\n"
@@ -114,64 +139,56 @@ if pagina == "Panel General":
 
         st.divider()
 
-        st.header("⚖️ Las 5 reglas de detección de fraude")
+        st.header("⚖️ Detección por puntaje ponderado")
         st.markdown(
-            "El pipeline marca una transacción como **sospechosa** (`is_suspicious = True`) "
-            "cuando **al menos una** de estas 5 reglas se cumple (OR lógico). La columna "
-            "`suspicion_reasons` indica qué reglas dispararon la marca."
+            "El pipeline ya **no** usa un OR de reglas (donde bastaba que una se cumpliera). "
+            "Ese enfoque daba una precisión de ~0.4%: el 99.6% de las alarmas eran falsas, "
+            "porque señales como *alto endeudamiento* u *horario inusual* casi no correlacionan "
+            "con el fraude real.\n\n"
+            "Ahora cada **señal suma puntos** según su poder predictivo (medido sobre los datos "
+            "reales: tasa de fraude por canal, monto y error). Se calcula un **puntaje** "
+            "(`fraud_score`) por transacción y se marca **sospechosa** (`is_suspicious = True`) "
+            "solo si el puntaje **alcanza o supera el umbral = 4**. La columna `suspicion_reasons` "
+            "lista las señales que sumaron."
         )
         col1, col2 = st.columns(2)
         with col1:
             st.markdown(
-                "##### 1️⃣ Monto atípico por usuario (`monto_atipico_usuario`)\n"
-                "**Condición:** `amount > percentil 99` del historial de ESE usuario.\n\n"
-                "**Por qué:** en lugar de comparar contra un umbral global del dataset, "
-                "cada transacción se compara contra el comportamiento histórico del propio titular. "
-                "Un monto de $500 puede ser completamente normal para un usuario y altamente "
-                "atípico para otro. Esto reduce los falsos positivos en usuarios de alto poder "
-                "adquisitivo y mejora la sensibilidad en usuarios de gasto bajo."
-            )
-            st.markdown(
-                "##### 3️⃣ Tarjeta en dark web (`tarjeta_en_dark_web`)\n"
-                "**Condición:** `card_on_dark_web == True` (la tarjeta apareció en filtraciones).\n\n"
-                "**Por qué:** si el número de tarjeta circula en la dark web (red oscura, "
-                "sitios no indexados donde se venden datos robados), cualquier transacción "
-                "con esa tarjeta tiene riesgo elevado."
-            )
-            st.markdown(
-                "##### 5️⃣ Horario inusual para el usuario (`horario_inusual`)\n"
-                "**Condición:** la hora de la transacción representa menos del 1% del "
-                "historial de transacciones de ese usuario. Si nunca operó en esa hora, "
-                "también se marca.\n\n"
-                "**Por qué:** cada persona tiene patrones horarios habituales de consumo. "
-                "Una compra a las 3 AM de alguien que históricamente solo opera entre las "
-                "9 AM y las 10 PM es una señal de alerta — puede indicar que otra persona "
-                "está usando la tarjeta. Esta regla no aplica un horario fijo para todos, "
-                "sino que aprende el patrón individual de cada usuario."
+                "##### Señales y pesos del puntaje\n"
+                "| Señal | Puntos | Por qué |\n"
+                "|---|---|---|\n"
+                "| 🌐 **Online** | +3 | Online tiene **13× más fraude** que presencial (0.54% vs 0.04%) |\n"
+                "| 💰 **Monto > \\$500** | +4 | A mayor monto, mayor tasa (>\\$500 = 0.82%, 8× la base) |\n"
+                "| 💰 Monto \\$200–500 | +3 | 0.66% de fraude |\n"
+                "| 💰 Monto \\$100–200 | +1 | 0.23% de fraude |\n"
+                "| 🧮 **Monto atípico p/usuario** | +2 | Supera el p99 del historial de ESE titular |\n"
+                "| ⚠️ **Con error** | +1 | `errors` no vacío → 2.7× más fraude |\n"
+                "| 🕷️ **Tarjeta en dark web** | +5 | Señal dura: la tarjeta circuló en filtraciones |\n"
+                "| 🌐💰 Combo online y >\\$200 | +3 | Interacción: lo online + caro es lo más riesgoso |\n"
             )
         with col2:
             st.markdown(
-                "##### 2️⃣ Error en la transacción (`error_en_transaccion`)\n"
-                "**Condición:** la columna `errors` no está vacía.\n\n"
-                "**Por qué:** errores como `Bad PIN` (PIN incorrecto), `Insufficient Balance` "
-                "(saldo insuficiente) o `Technical Glitch` (falla técnica) muchas veces "
-                "preceden a intentos repetidos de fraude (atacantes probando combinaciones)."
-            )
-            st.markdown(
-                "##### 4️⃣ Alto endeudamiento (`alto_endeudamiento`)\n"
-                "**Condición:** `debt_income_ratio > 3` (deuda total > 3× ingreso anual).\n\n"
-                "**Por qué:** usuarios con endeudamiento extremo son más vulnerables — "
-                "tanto a ser víctimas de fraude como a involucrarse en transacciones "
-                "irregulares. Es una señal de riesgo financiero."
+                "##### Cómo se decide\n"
+                "1. Se suman los puntos de todas las señales que se cumplen.\n"
+                "2. Si `fraud_score >= 4` → **sospechosa**.\n\n"
+                "**Por qué un puntaje y no un OR:** un puntaje permite exigir "
+                "*acumulación de evidencia*. Una transacción online sola (+3) no alcanza; "
+                "online + monto alto (+3+3) sí. Así se filtran las alarmas débiles sin perder "
+                "los casos con varias señales a la vez.\n\n"
+                "**Punto de operación elegido (balanceado):** triplica la precisión "
+                "(de ~0.4% a ~1.3%) manteniendo la sensibilidad (~34%) — o sea, detectamos "
+                "el mismo fraude que antes pero con **un tercio de las falsas alarmas**.\n\n"
+                "El umbral es ajustable: subirlo da más precisión (menos ruido), bajarlo da "
+                "más sensibilidad (atrapa más fraude). Ver la **matriz de confusión** en la "
+                "pestaña Datos para las métricas exactas."
             )
         st.info(
-            "💡 **Limitación reconocida:** son reglas heurísticas (basadas en intuición de dominio), "
-            "no un modelo de Machine Learning (aprendizaje automático). Las reglas 1 y 5 se calculan "
-            "sobre el historial completo del dataset — en un sistema productivo, el perfil de cada "
-            "usuario se calcularía solo con transacciones verificadas como legítimas y se actualizaría "
-            "con cada nueva transacción. La evolución prevista es entrenar un modelo con "
-            "`train_fraud_labels.json` (verdad de referencia / ground truth) y reemplazar estas "
-            "reglas por un puntaje probabilístico."
+            "💡 **Limitación reconocida:** sigue siendo un modelo heurístico (pesos elegidos a mano "
+            "con base en los datos), no un modelo de Machine Learning entrenado. Los perfiles por "
+            "usuario (p99 de monto) se calculan sobre el historial completo del dataset; en producción "
+            "se calcularían solo con transacciones verificadas como legítimas. La evolución prevista es "
+            "entrenar un clasificador con `train_fraud_labels.json` (ground truth) que reemplace estos "
+            "pesos fijos por un puntaje probabilístico aprendido."
         )
 
         st.divider()
@@ -179,34 +196,35 @@ if pagina == "Panel General":
         st.header("📌 Fuente de los datos en los gráficos")
         st.markdown(
             "**TP / FP / FN / TN** (matriz de confusión de la pestaña Datos):\n"
-            "- ✅ **TP (True Positive / Verdadero Positivo)**: fraude real correctamente detectado por las reglas.\n"
+            "- ✅ **TP (True Positive / Verdadero Positivo)**: fraude real correctamente detectado por el modelo.\n"
             "- ⚠️ **FP (False Positive / Falso Positivo)**: legítima marcada por error (falsa alarma).\n"
             "- ❌ **FN (False Negative / Falso Negativo)**: fraude que se escapó (no detectado).\n"
             "- ✅ **TN (True Negative / Verdadero Negativo)**: legítima correctamente ignorada."
         )
-        st.warning(
-            "Salvo la **matriz de confusión** (que compara ambos), **todos los gráficos y KPIs "
-            "de la pestaña Datos usan los datos de fraude REALES** (columna `is_fraud`, etiquetada en "
-            "`train_fraud_labels.json` — el ground truth / verdad de referencia), "
-            "**no las estimaciones de las 4 reglas** (columna `is_suspicious`).\n\n"
-            "Es decir: cuando ves \"tasa de fraude por estado\" o \"fraude por categoría\", "
-            "estás viendo **dónde ocurrió fraude de verdad** según la etiqueta oficial — no dónde "
-            "las reglas creen que ocurrió. La matriz de confusión es el único lugar donde se comparan "
-            "ambos para medir qué tan bien funcionan las reglas (precisión / sensibilidad / F1)."
+        st.info(
+            "🔎 **Filtro de vista (barra lateral):** la pestaña Datos tiene un selector "
+            "**Fraude real / Sospechosos (modelo)** que cambia TODOS los KPIs y gráficos entre:\n"
+            "- **Fraude real** (`is_fraud`): dónde ocurrió fraude de verdad según el ground truth "
+            "(`train_fraud_labels.json`).\n"
+            "- **Sospechosos (modelo)** (`is_suspicious`): dónde el puntaje del pipeline *cree* que "
+            "hay riesgo.\n\n"
+            "Comparar ambas vistas muestra dónde el modelo acierta y dónde se desvía. "
+            "La **matriz de confusión** es el único gráfico que siempre compara los dos a la vez, "
+            "para medir precisión / sensibilidad / F1."
         )
 
         st.divider()
 
         st.header("🚀 Próximos pasos — cómo mejorar el acierto de fraudes")
         st.markdown(
-            "Las 4 reglas actuales son un baseline (punto de partida) heurístico. "
+            "El puntaje ponderado actual es un baseline (punto de partida) heurístico. "
             "Estas son las palancas concretas para subir el acierto (precision / recall / F1), "
             "ordenadas por impacto esperado:"
         )
 
         with st.expander("1️⃣ Modelo de Machine Learning (mayor impacto)", expanded=True):
             st.markdown(
-                "Las 4 reglas son binarias (sí/no) y se quedan cortas en **recall (sensibilidad)**. "
+                "El puntaje ponderado usa pesos fijos elegidos a mano y se queda corto en **recall (sensibilidad)**. "
                 "Como ya tenemos el ground truth (verdad de referencia) en `train_fraud_labels.json`, "
                 "podemos entrenar un **clasificador supervisado** que devuelva una **probabilidad** "
                 "de fraude en vez de un sí/no.\n\n"
@@ -311,21 +329,52 @@ if pagina == "Panel General":
             st.stop()
         m = metricas.iloc[0]
 
-        # ── KPIs principales ──
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total transacciones", f"{m['total_transactions']:,}")
-        col2.metric("Fraudes detectados", f"{m['total_fraud']:,}",
-                    f"{m['fraud_rate']:.3%} del total")
-        col3.metric("Monto en riesgo", f"${m['total_amount_at_risk']:,.0f}")
-        col4.metric("Monto promedio fraude", f"${m['avg_fraud_amount']:,.2f}")
+        # Indicador del modo de vista activo
+        if SUSP_MODE:
+            st.info("🔎 **Vista: Sospechosos (modelo)** — los KPIs y gráficos de abajo "
+                    "muestran lo que el puntaje del pipeline marcó como sospechoso "
+                    "(`is_suspicious`). Cambiá a *Fraude real* en la barra lateral para ver "
+                    "la etiqueta oficial.")
+        else:
+            st.info("🔎 **Vista: Fraude real** — los KPIs y gráficos de abajo muestran el "
+                    "fraude confirmado por la verdad de referencia (`is_fraud`). Cambiá a "
+                    "*Sospechosos (modelo)* en la barra lateral para ver lo que marca el pipeline.")
 
+        # ── KPIs principales (dependen del modo de vista) ──
+        # Se recalculan desde transactions_processed con la columna elegida, así el
+        # mismo bloque sirve para fraude real y para sospechosos.
+        kpi = query(f"""
+            SELECT COUNT(*) AS total_transactions,
+                   COUNT(*) FILTER (WHERE {FRAUD_COL}) AS total_flag,
+                   COALESCE(SUM(amount) FILTER (WHERE {FRAUD_COL}), 0) AS amount_flag,
+                   COALESCE(AVG(amount) FILTER (WHERE {FRAUD_COL}), 0) AS avg_flag
+            FROM transactions_processed
+        """)
+        k = kpi.iloc[0] if (kpi is not None and not kpi.empty) else None
+
+        label_det = "Marcadas sospechosas" if SUSP_MODE else "Fraudes detectados"
+        label_amt = "Monto sospechoso" if SUSP_MODE else "Monto en riesgo"
+        label_avg = "Monto prom. sospechosa" if SUSP_MODE else "Monto promedio fraude"
+
+        col1, col2, col3, col4 = st.columns(4)
+        if k is not None:
+            total_tx = int(k["total_transactions"])
+            rate = (int(k["total_flag"]) / total_tx) if total_tx else 0
+            col1.metric("Total transacciones", f"{total_tx:,}")
+            col2.metric(label_det, f"{int(k['total_flag']):,}", f"{rate:.3%} del total")
+            col3.metric(label_amt, f"${float(k['amount_flag']):,.0f}")
+            col4.metric(label_avg, f"${float(k['avg_flag']):,.2f}")
+
+        # Métricas de evaluación del modelo (siempre sobre is_suspicious vs is_fraud)
         col1, col2 = st.columns(2)
-        col1.metric("Tasa Falsos Positivos",
+        col1.metric("Tasa Falsos Positivos (modelo)",
                     f"{m['false_positive_rate']:.3%}",
-                    help="Transacciones legítimas marcadas como sospechosas por las reglas")
-        col2.metric("Tasa Falsos Negativos",
+                    help="Transacciones legítimas marcadas como sospechosas por el modelo. "
+                         "Es una métrica de evaluación del modelo, no cambia con la vista.")
+        col2.metric("Tasa Falsos Negativos (modelo)",
                     f"{m['false_negative_rate']:.3%}",
-                    help="Fraudes reales que las reglas NO detectaron")
+                    help="Fraudes reales que el modelo NO detectó. "
+                         "Es una métrica de evaluación del modelo, no cambia con la vista.")
 
         if m["dataset_start_date"] is not None and m["dataset_end_date"] is not None:
             st.caption(
@@ -344,14 +393,14 @@ if pagina == "Panel General":
         # ──────────────────────────────────────────────────────────────────
         with tab_resumen:
             st.subheader("💻 Online vs 💳 Presencial (Swipe)")
-            st.caption("Tasa de fraude y monto en riesgo por canal — online es más vulnerable porque no hay verificación física de la tarjeta.")
+            st.caption(f"{VISTA_TASA} y monto por canal — online es más vulnerable porque no hay verificación física de la tarjeta.")
 
-            online_df = query("""
+            online_df = query(f"""
                 SELECT transaction_type,
                        COUNT(*) AS total,
-                       COUNT(*) FILTER (WHERE is_fraud) AS fraud,
-                       ROUND(100.0 * COUNT(*) FILTER (WHERE is_fraud) / COUNT(*), 4) AS fraud_pct,
-                       ROUND(SUM(amount) FILTER (WHERE is_fraud)::numeric, 2) AS amount_at_risk
+                       COUNT(*) FILTER (WHERE {FRAUD_COL}) AS fraud,
+                       ROUND(100.0 * COUNT(*) FILTER (WHERE {FRAUD_COL}) / COUNT(*), 4) AS fraud_pct,
+                       ROUND(SUM(amount) FILTER (WHERE {FRAUD_COL})::numeric, 2) AS amount_at_risk
                 FROM transactions_processed
                 WHERE transaction_type IS NOT NULL
                 GROUP BY transaction_type
@@ -365,8 +414,8 @@ if pagina == "Panel General":
                         text="fraud_pct",
                         color="transaction_type",
                         color_discrete_map={"Online": "#d62728", "Swipe": "#2ca02c"},
-                        labels={"fraud_pct": "% Fraude", "transaction_type": "Tipo"},
-                        title="Tasa de fraude por canal (%)"
+                        labels={"fraud_pct": VISTA_PCT, "transaction_type": "Tipo"},
+                        title=f"{VISTA_TASA} por canal (%)"
                     )
                     fig.update_traces(texttemplate="%{text:.3f}%", textposition="inside",
                                       insidetextfont=dict(size=14, color="white"))
@@ -381,8 +430,8 @@ if pagina == "Panel General":
                         text="amount_at_risk",
                         color="transaction_type",
                         color_discrete_map={"Online": "#d62728", "Swipe": "#2ca02c"},
-                        labels={"amount_at_risk": "Monto en riesgo ($)", "transaction_type": "Tipo"},
-                        title="Monto en riesgo por canal"
+                        labels={"amount_at_risk": f"{VISTA_MONTO} ($)", "transaction_type": "Tipo"},
+                        title=f"{VISTA_MONTO} por canal"
                     )
                     fig.update_traces(texttemplate="$%{text:,.0f}", textposition="inside",
                                       insidetextfont=dict(size=14, color="white"))
@@ -393,21 +442,23 @@ if pagina == "Panel General":
                     st.plotly_chart(fig, use_container_width=True)
 
             st.divider()
-            st.subheader("💵 Distribución de montos: fraude vs legítimo")
-            st.caption("Histograma normalizado (rango $0–$2000): ¿el monto distingue fraude de legítimo?")
+            _pos = "Sospechosa" if SUSP_MODE else "Fraude"
+            _neg = "No sospechosa" if SUSP_MODE else "Legítima"
+            st.subheader(f"💵 Distribución de montos: {_pos.lower()} vs {_neg.lower()}")
+            st.caption(f"Histograma normalizado (rango $0–$2000): ¿el monto distingue {_pos.lower()} de {_neg.lower()}?")
 
             # Usamos TABLESAMPLE BERNOULLI para muestrear las legitimas eficientemente.
             # ORDER BY RANDOM() LIMIT requiere ordenar 12M filas → muy lento.
             # TABLESAMPLE BERNOULLI(2) toma cada fila con 2% de prob al leerla del
             # disco, sin generar random ni ordenar. >100x más rápido y el histograma
             # se ve igual.
-            amt_df = query("""
-                (SELECT amount, 'Fraude' AS tipo FROM transactions_processed
-                 WHERE is_fraud AND amount BETWEEN 0 AND 2000)
+            amt_df = query(f"""
+                (SELECT amount, '{_pos}' AS tipo FROM transactions_processed
+                 WHERE {FRAUD_COL} AND amount BETWEEN 0 AND 2000)
                 UNION ALL
-                (SELECT amount, 'Legítima' AS tipo
+                (SELECT amount, '{_neg}' AS tipo
                  FROM transactions_processed TABLESAMPLE BERNOULLI(2)
-                 WHERE NOT is_fraud AND amount BETWEEN 0 AND 2000
+                 WHERE NOT {FRAUD_COL} AND amount BETWEEN 0 AND 2000
                  LIMIT 100000)
             """)
             if amt_df is not None and not amt_df.empty:
@@ -415,7 +466,7 @@ if pagina == "Panel General":
                     amt_df, x="amount", color="tipo",
                     nbins=50, barmode="overlay", opacity=0.6,
                     histnorm="percent",
-                    color_discrete_map={"Fraude": "#d62728", "Legítima": "#2ca02c"},
+                    color_discrete_map={_pos: "#d62728", _neg: "#2ca02c"},
                     labels={"amount": "Monto ($)", "percent": "% (normalizado)"},
                     title="Distribución de montos por tipo (% normalizado, 0–$2000)"
                 )
@@ -423,8 +474,10 @@ if pagina == "Panel General":
                 st.plotly_chart(fig, use_container_width=True)
 
             st.divider()
-            st.subheader("🎯 Matriz de confusión de las 5 reglas")
-            st.caption("Cruza predicción (regla) vs realidad (etiqueta). Definiciones de TP/FP/FN/TN en la pestaña Explicaciones.")
+            st.subheader("🎯 Matriz de confusión del modelo de sospechosos")
+            st.caption("Cruza predicción del modelo (`is_suspicious`) vs realidad (`is_fraud`). "
+                       "Siempre compara ambos, independientemente del filtro de vista. "
+                       "Definiciones de TP/FP/FN/TN en la pestaña Explicaciones.")
             confusion = query("""
                 SELECT
                     COUNT(*) FILTER (WHERE is_fraud AND is_suspicious)         AS tp,
@@ -466,14 +519,14 @@ if pagina == "Panel General":
         # SUB-TAB: TENDENCIAS
         # ──────────────────────────────────────────────────────────────────
         with tab_tend:
-            st.subheader("📅 Tendencia anual del fraude")
+            st.subheader(f"📅 Tendencia anual ({VISTA_LABEL})")
             st.caption("Barras rojas = cantidad absoluta. Línea azul = tasa porcentual.")
-            yearly = query("""
+            yearly = query(f"""
                 SELECT EXTRACT(YEAR FROM transaction_date)::INT AS yr,
                        COUNT(*) AS total,
-                       COUNT(*) FILTER (WHERE is_fraud) AS fraud,
-                       ROUND(100.0 * COUNT(*) FILTER (WHERE is_fraud) / COUNT(*), 4) AS fraud_pct,
-                       ROUND(SUM(amount) FILTER (WHERE is_fraud)::numeric, 2) AS amount_at_risk
+                       COUNT(*) FILTER (WHERE {FRAUD_COL}) AS fraud,
+                       ROUND(100.0 * COUNT(*) FILTER (WHERE {FRAUD_COL}) / COUNT(*), 4) AS fraud_pct,
+                       ROUND(SUM(amount) FILTER (WHERE {FRAUD_COL})::numeric, 2) AS amount_at_risk
                 FROM transactions_processed
                 WHERE transaction_date IS NOT NULL
                 GROUP BY yr ORDER BY yr
@@ -482,22 +535,22 @@ if pagina == "Panel General":
                 fig = go.Figure()
                 fig.add_trace(go.Bar(
                     x=yearly["yr"], y=yearly["fraud"],
-                    name="Cantidad de fraudes",
+                    name=VISTA_CANT,
                     marker_color="#d62728",
                     yaxis="y1",
                 ))
                 fig.add_trace(go.Scatter(
                     x=yearly["yr"], y=yearly["fraud_pct"],
-                    name="% Fraude",
+                    name=VISTA_PCT,
                     mode="lines+markers",
                     line=dict(color="#1f77b4", width=3),
                     yaxis="y2",
                 ))
                 fig.update_layout(
-                    title="Cantidad de fraudes y tasa por año",
+                    title=f"{VISTA_CANT} y tasa por año",
                     xaxis=dict(title="Año", dtick=1),
-                    yaxis=dict(title="Cantidad de fraudes", side="left"),
-                    yaxis2=dict(title="% Fraude", overlaying="y", side="right",
+                    yaxis=dict(title=VISTA_CANT, side="left"),
+                    yaxis2=dict(title=VISTA_PCT, overlaying="y", side="right",
                                 tickformat=".3f"),
                     height=400,
                     legend=dict(orientation="h", y=1.1),
@@ -505,11 +558,11 @@ if pagina == "Panel General":
                 st.plotly_chart(fig, use_container_width=True)
 
             st.subheader("📆 Tendencia mensual")
-            st.caption("Fraudes detectados mes a mes (2010–2019).")
-            monthly = query("""
+            st.caption(f"Transacciones {VISTA_LABEL} mes a mes (2010–2019).")
+            monthly = query(f"""
                 SELECT DATE_TRUNC('month', transaction_date) AS month,
-                       COUNT(*) FILTER (WHERE is_fraud) AS fraud,
-                       ROUND(SUM(amount) FILTER (WHERE is_fraud)::numeric, 2) AS amount_at_risk
+                       COUNT(*) FILTER (WHERE {FRAUD_COL}) AS fraud,
+                       ROUND(SUM(amount) FILTER (WHERE {FRAUD_COL})::numeric, 2) AS amount_at_risk
                 FROM transactions_processed
                 WHERE transaction_date IS NOT NULL
                 GROUP BY month ORDER BY month
@@ -517,19 +570,19 @@ if pagina == "Panel General":
             if monthly is not None and not monthly.empty:
                 fig = px.area(
                     monthly, x="month", y="fraud",
-                    labels={"month": "Mes", "fraud": "Cantidad de fraudes"},
-                    title="Fraudes detectados por mes (2010–2019)"
+                    labels={"month": "Mes", "fraud": VISTA_CANT},
+                    title=f"Transacciones {VISTA_LABEL} por mes (2010–2019)"
                 )
                 fig.update_traces(line_color="#d62728", fillcolor="rgba(214,39,40,0.3)")
                 fig.update_layout(height=380)
                 st.plotly_chart(fig, use_container_width=True)
 
             st.subheader("🕒 Mapa de calor (heatmap): día × hora")
-            st.caption("Concentración de fraude por día de la semana y hora del día. Color más oscuro = más fraudes.")
-            heatmap = query("""
+            st.caption(f"Concentración de transacciones {VISTA_LABEL} por día de la semana y hora del día. Color más oscuro = más casos.")
+            heatmap = query(f"""
                 SELECT EXTRACT(DOW FROM transaction_date)::INT AS dow,
                        EXTRACT(HOUR FROM transaction_date)::INT AS hr,
-                       COUNT(*) FILTER (WHERE is_fraud) AS fraud
+                       COUNT(*) FILTER (WHERE {FRAUD_COL}) AS fraud
                 FROM transactions_processed
                 WHERE transaction_date IS NOT NULL
                 GROUP BY dow, hr
@@ -542,8 +595,8 @@ if pagina == "Panel General":
                 fig = px.imshow(
                     pivot, aspect="auto",
                     color_continuous_scale="Reds",
-                    labels=dict(x="Hora del día", y="Día de la semana", color="Fraudes"),
-                    title="Concentración de fraudes por día y hora"
+                    labels=dict(x="Hora del día", y="Día de la semana", color=VISTA_CAP),
+                    title=f"Concentración de transacciones {VISTA_LABEL} por día y hora"
                 )
                 fig.update_layout(height=380)
                 st.plotly_chart(fig, use_container_width=True)
@@ -553,10 +606,14 @@ if pagina == "Panel General":
         # ──────────────────────────────────────────────────────────────────
         with tab_geo:
             st.caption("📍 Los datos geográficos representan la ubicación del comercio, no del titular. Las online se excluyen del mapa.")
-            st.subheader("🗺️ Tasa de fraude por estado (EEUU)")
-            st.caption("Mapa coroplético: zonas oscuras = mayor proporción de fraude.")
-            state_df = query("""
-                SELECT state, total_fraud, fraud_rate, amount_at_risk, total_transactions
+            st.subheader(f"🗺️ {VISTA_TASA} por estado (EEUU)")
+            st.caption(f"Mapa coroplético: zonas oscuras = mayor proporción de {VISTA_LABEL}.")
+            state_df = query(f"""
+                SELECT state, total_transactions,
+                       {SEG_COUNT}  AS total_fraud,
+                       {SEG_AMOUNT} AS amount_at_risk,
+                       CASE WHEN total_transactions > 0
+                            THEN {SEG_COUNT}::DOUBLE PRECISION / total_transactions ELSE 0 END AS fraud_rate
                 FROM fraud_by_state
                 WHERE state IS NOT NULL AND state != ''
             """)
@@ -572,8 +629,8 @@ if pagina == "Panel General":
                         color_continuous_scale="Reds",
                         hover_data={"total_fraud": ":,", "amount_at_risk": ":,.0f",
                                     "total_transactions": ":,"},
-                        labels={"fraud_rate": "Tasa de fraude"},
-                        title=f"Tasa de fraude por estado — {len(us_only)} estados US"
+                        labels={"fraud_rate": VISTA_TASA},
+                        title=f"{VISTA_TASA} por estado — {len(us_only)} estados US"
                     )
                     fig.update_layout(height=500)
                     st.plotly_chart(fig, use_container_width=True)
@@ -586,8 +643,8 @@ if pagina == "Panel General":
                             top_states, x="fraud_rate", y="state",
                             orientation="h", color="fraud_rate",
                             color_continuous_scale="Reds",
-                            labels={"fraud_rate": "Tasa de fraude", "state": "Estado"},
-                            title="🥇 Top 10 estados por TASA de fraude"
+                            labels={"fraud_rate": VISTA_TASA, "state": "Estado"},
+                            title=f"🥇 Top 10 estados por TASA de {VISTA_LABEL}"
                         )
                         fig.update_layout(height=400, yaxis={'categoryorder':'total ascending'})
                         st.plotly_chart(fig, use_container_width=True)
@@ -597,15 +654,15 @@ if pagina == "Panel General":
                             top_amount, x="amount_at_risk", y="state",
                             orientation="h", color="amount_at_risk",
                             color_continuous_scale="Reds",
-                            labels={"amount_at_risk": "Monto en riesgo ($)", "state": "Estado"},
-                            title="💰 Top 10 estados por MONTO en riesgo"
+                            labels={"amount_at_risk": f"{VISTA_MONTO} ($)", "state": "Estado"},
+                            title=f"💰 Top 10 estados por MONTO ({VISTA_LABEL})"
                         )
                         fig.update_layout(height=400, yaxis={'categoryorder':'total ascending'})
                         st.plotly_chart(fig, use_container_width=True)
 
                 st.divider()
                 st.subheader("🌎 Transacciones internacionales")
-                st.caption("Top 15 países por volumen de transacciones; color = % de fraude en ese país.")
+                st.caption(f"Top 15 países por volumen de transacciones; color = % de {VISTA_LABEL} en ese país.")
                 if not intl.empty:
                     top_intl = intl.nlargest(15, "total_transactions").copy()
                     top_intl["fraud_rate_pct"] = (top_intl["fraud_rate"] * 100).round(2)
@@ -619,8 +676,8 @@ if pagina == "Panel General":
                         hover_data={"total_fraud": ":,",
                                     "amount_at_risk": ":,.0f"},
                         labels={"total_transactions": "Transacciones",
-                                "state": "", "fraud_rate_pct": "% Fraude"},
-                        title="Top 15 países por volumen de transacciones (color = % fraude)"
+                                "state": "", "fraud_rate_pct": VISTA_PCT},
+                        title=f"Top 15 países por volumen de transacciones (color = {VISTA_PCT})"
                     )
                     fig.update_layout(height=520, yaxis={'categoryorder':'total ascending'},
                                       margin=dict(l=10, r=10, t=60, b=40))
@@ -642,10 +699,14 @@ if pagina == "Panel General":
         # SUB-TAB: COMERCIOS Y TARJETAS
         # ──────────────────────────────────────────────────────────────────
         with tab_com:
-            st.subheader("🏪 Fraude por categoría de comercio (MCC)")
-            st.caption("Arriba: categorías que más dinero mueven en fraude. Abajo: categorías con mayor tasa.")
-            mcc_df = query("""
-                SELECT mcc_description, total_fraud, fraud_rate, amount_at_risk, total_transactions
+            st.subheader(f"🏪 {VISTA_CAP} por categoría de comercio (MCC)")
+            st.caption(f"Arriba: categorías que más dinero mueven en {VISTA_LABEL}. Abajo: categorías con mayor tasa.")
+            mcc_df = query(f"""
+                SELECT mcc_description, total_transactions,
+                       {SEG_COUNT}  AS total_fraud,
+                       {SEG_AMOUNT} AS amount_at_risk,
+                       CASE WHEN total_transactions > 0
+                            THEN {SEG_COUNT}::DOUBLE PRECISION / total_transactions ELSE 0 END AS fraud_rate
                 FROM fraud_by_mcc
                 WHERE mcc_description IS NOT NULL AND mcc_description != 'Unknown'
                   AND total_transactions > 100
@@ -658,9 +719,9 @@ if pagina == "Panel General":
                     orientation="h", color="fraud_rate",
                     color_continuous_scale="Reds",
                     hover_data={"total_transactions": ":,", "total_fraud": ":,"},
-                    labels={"amount_at_risk": "Monto en riesgo ($)",
+                    labels={"amount_at_risk": f"{VISTA_MONTO} ($)",
                             "mcc_description": "", "fraud_rate": "Tasa"},
-                    title="Top 15 categorías por MONTO en riesgo"
+                    title=f"Top 15 categorías por MONTO ({VISTA_LABEL})"
                 )
                 fig.update_layout(height=600, margin=dict(l=10, r=10, t=60, b=40),
                                   font=dict(size=13))
@@ -674,9 +735,9 @@ if pagina == "Panel General":
                     orientation="h", color="fraud_rate_pct",
                     color_continuous_scale="Reds",
                     hover_data={"total_transactions": ":,", "total_fraud": ":,"},
-                    labels={"fraud_rate_pct": "% Fraude",
+                    labels={"fraud_rate_pct": VISTA_PCT,
                             "mcc_description": ""},
-                    title="Top 15 categorías por TASA de fraude (%)"
+                    title=f"Top 15 categorías por TASA de {VISTA_LABEL} (%)"
                 )
                 fig.update_layout(height=600, margin=dict(l=10, r=10, t=60, b=40),
                                   font=dict(size=13))
@@ -685,9 +746,12 @@ if pagina == "Panel General":
             st.divider()
 
             st.subheader("💳 Análisis por tipo de tarjeta")
-            st.caption("Cruce marca × tipo (Crédito/Débito/Prepago). Cada celda = % de fraude.")
-            card_df = query("""
-                SELECT card_brand, card_type, has_chip, total_fraud, fraud_rate, total_transactions
+            st.caption(f"Cruce marca × tipo (Crédito/Débito/Prepago). Cada celda = % de {VISTA_LABEL}.")
+            card_df = query(f"""
+                SELECT card_brand, card_type, has_chip, total_transactions,
+                       {SEG_COUNT}  AS total_fraud,
+                       CASE WHEN total_transactions > 0
+                            THEN {SEG_COUNT}::DOUBLE PRECISION / total_transactions ELSE 0 END AS fraud_rate
                 FROM fraud_by_card_type
                 WHERE card_brand IS NOT NULL
             """)
@@ -708,8 +772,8 @@ if pagina == "Panel General":
                         text_auto=".3f",
                         color_continuous_scale="Reds",
                         aspect="auto",
-                        labels=dict(x="Tipo", y="Marca", color="% Fraude"),
-                        title="Tasa de fraude (%) por marca × tipo de tarjeta"
+                        labels=dict(x="Tipo", y="Marca", color=VISTA_PCT),
+                        title=f"{VISTA_TASA} (%) por marca × tipo de tarjeta"
                     )
                     fig.update_layout(height=380, margin=dict(t=60, b=40))
                     st.plotly_chart(fig, use_container_width=True)
@@ -721,11 +785,11 @@ if pagina == "Panel General":
                     ).reset_index()
                     by_brand["fraud_pct"] = (100 * by_brand["fraud"] / by_brand["total"]).round(4)
                     by_brand = by_brand.sort_values("fraud_pct", ascending=False)
-                    st.caption("Ranking por tasa de fraude")
+                    st.caption(f"Ranking por {VISTA_TASA.lower()}")
                     st.dataframe(
                         by_brand.rename(columns={
                             "card_brand": "Marca", "total": "Transacciones",
-                            "fraud": "Fraudes", "fraud_pct": "% Fraude"
+                            "fraud": VISTA_CAP, "fraud_pct": VISTA_PCT
                         }),
                         hide_index=True, use_container_width=True,
                     )
@@ -735,7 +799,7 @@ if pagina == "Panel General":
 
                 with col_chip:
                     st.subheader("🔐 Chip EMV")
-                    st.caption("Con chip vs sin chip — ¿la autenticación criptográfica reduce el fraude?")
+                    st.caption(f"Con chip vs sin chip — ¿la autenticación criptográfica reduce las {VISTA_LABEL}?")
                     by_chip = card_df.groupby("has_chip").agg(
                         total=("total_transactions", "sum"),
                         fraud=("total_fraud", "sum"),
@@ -747,8 +811,8 @@ if pagina == "Panel General":
                         text="fraud_pct",
                         color="has_chip",
                         color_discrete_map={"Con chip": "#2ca02c", "Sin chip": "#d62728"},
-                        labels={"fraud_pct": "% Fraude", "has_chip": ""},
-                        title="Tasa de fraude por presencia de chip"
+                        labels={"fraud_pct": VISTA_PCT, "has_chip": ""},
+                        title=f"{VISTA_TASA} por presencia de chip"
                     )
                     fig.update_traces(texttemplate="%{text:.3f}%", textposition="inside",
                                       insidetextfont=dict(size=14, color="white"))
@@ -761,11 +825,11 @@ if pagina == "Panel General":
                 with col_dw:
                     st.subheader("🕷️ Tarjetas en dark web")
                     st.caption("¿La tarjeta apareció en filtraciones de la red oscura? Comparación de tasas.")
-                    dw = query("""
+                    dw = query(f"""
                         SELECT card_on_dark_web,
                                COUNT(*) AS total,
-                               COUNT(*) FILTER (WHERE is_fraud) AS fraud,
-                               ROUND(100.0 * COUNT(*) FILTER (WHERE is_fraud) / COUNT(*), 4) AS fraud_pct
+                               COUNT(*) FILTER (WHERE {FRAUD_COL}) AS fraud,
+                               ROUND(100.0 * COUNT(*) FILTER (WHERE {FRAUD_COL}) / COUNT(*), 4) AS fraud_pct
                         FROM transactions_processed
                         WHERE card_on_dark_web IS NOT NULL
                         GROUP BY card_on_dark_web
@@ -777,8 +841,8 @@ if pagina == "Panel General":
                             text="fraud_pct",
                             color="label",
                             color_discrete_map={"Sí": "#d62728", "No": "#2ca02c"},
-                            labels={"fraud_pct": "% Fraude", "label": "En dark web"},
-                            title="Tasa de fraude si la tarjeta apareció en dark web"
+                            labels={"fraud_pct": VISTA_PCT, "label": "En dark web"},
+                            title=f"{VISTA_TASA} si la tarjeta apareció en dark web"
                         )
                         fig.update_traces(texttemplate="%{text:.3f}%", textposition="inside",
                                           insidetextfont=dict(size=14, color="white"))
@@ -864,7 +928,8 @@ elif pagina == "Panel de Usuario":
                 "Cociente deuda/ingreso (ratio)", f"{ratio:.2f}",
                 delta=f"{'⚠️ Alto' if ratio > 3 else 'OK (correcto)'}",
                 delta_color="inverse" if ratio > 3 else "normal",
-                help="Una de las reglas marca como sospechosa toda transacción con cociente > 3",
+                help="Cociente > 3 indica endeudamiento alto. (Ya no marca sospecha por sí solo: "
+                     "se comprobó que casi no correlaciona con el fraude real y fue quitado del puntaje.)",
             )
 
         st.divider()

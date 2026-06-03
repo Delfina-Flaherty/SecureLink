@@ -39,9 +39,10 @@ CREATE TABLE IF NOT EXISTS transactions_processed (
     distance_km         NUMERIC(10, 2),
     -- Etiqueta real de fraude
     is_fraud            BOOLEAN,
-    -- Resultado de las reglas del pipeline
+    -- Resultado de la detección por puntaje ponderado
     is_suspicious       BOOLEAN,
     suspicion_reasons   TEXT,
+    fraud_score         INTEGER,    -- puntaje ponderado (umbral de marcado = 4)
     -- Cuándo fue procesado
     processed_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -75,7 +76,9 @@ CREATE TABLE IF NOT EXISTS fraud_by_mcc (
     total_transactions  INTEGER,
     total_fraud         INTEGER,
     fraud_rate          NUMERIC(8, 4),
-    amount_at_risk      NUMERIC(16, 2)
+    amount_at_risk      NUMERIC(16, 2),
+    total_suspicious    BIGINT DEFAULT 0,
+    amount_suspicious   NUMERIC(18, 2) DEFAULT 0
 );
 
 -- -------------------------------------------------------
@@ -90,7 +93,9 @@ CREATE TABLE IF NOT EXISTS fraud_by_card_type (
     total_transactions  INTEGER,
     total_fraud         INTEGER,
     fraud_rate          NUMERIC(8, 4),
-    amount_at_risk      NUMERIC(16, 2)
+    amount_at_risk      NUMERIC(16, 2),
+    total_suspicious    BIGINT DEFAULT 0,
+    amount_suspicious   NUMERIC(18, 2) DEFAULT 0
 );
 
 -- -------------------------------------------------------
@@ -103,7 +108,9 @@ CREATE TABLE IF NOT EXISTS fraud_by_state (
     total_transactions  INTEGER,
     total_fraud         INTEGER,
     fraud_rate          NUMERIC(8, 4),
-    amount_at_risk      NUMERIC(16, 2)
+    amount_at_risk      NUMERIC(16, 2),
+    total_suspicious    BIGINT DEFAULT 0,
+    amount_suspicious   NUMERIC(18, 2) DEFAULT 0
 );
 
 -- -------------------------------------------------------
@@ -119,7 +126,9 @@ CREATE TABLE IF NOT EXISTS fraud_by_merchant (
     total_transactions  INTEGER,
     total_fraud         INTEGER,
     fraud_rate          NUMERIC(8, 4),
-    amount_at_risk      NUMERIC(16, 2)
+    amount_at_risk      NUMERIC(16, 2),
+    total_suspicious    BIGINT DEFAULT 0,
+    amount_suspicious   NUMERIC(18, 2) DEFAULT 0
 );
 
 -- -------------------------------------------------------

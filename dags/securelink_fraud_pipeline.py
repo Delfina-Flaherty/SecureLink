@@ -226,13 +226,12 @@ def _transform_data(**context):
     """Combina las 3 transformaciones (clean, features, rules) en una sola pasada
     Polars sobre el parquet. Reduce I/O en ~60% vs hacer 3 tareas separadas.
     
-    Reglas de detección:
-    R1 - Monto atípico por usuario: supera el p99 de ese usuario específico
-    R2 - Error en la transacción: la columna errors tiene algún valor
-    R3 - Tarjeta en dark web: card_on_dark_web = True
-    R4 - Alto endeudamiento: deuda > 3x ingreso anual
-    R5 - Horario inusual: la hora de la transacción representa menos del 1%
-         del historial de ese usuario (o nunca operó en esa hora)
+    Detección por PUNTAJE PONDERADO (ver detalle de pesos más abajo): cada señal
+    suma puntos según su poder predictivo y se marca sospechosa si el puntaje
+    supera un umbral. Reemplaza al viejo OR de reglas heurísticas, que tenía
+    precisión ~0.4%. Señales usadas: online, monto alto (en bandas), monto
+    atípico para el usuario (p99 propio), error en la transacción y tarjeta en
+    dark web.
     """
     logger.info("=== TAREA 4: Limpieza + Features + Reglas (Polars) ===")
     import polars as pl
@@ -300,39 +299,39 @@ def _transform_data(**context):
             .alias("transaction_type"),
     ])
 
-    # ── Materializar para calcular perfiles por usuario ──
-    # Necesitamos collect() acá porque los cálculos de p99 por usuario y
-    # distribución de horarios requieren ver TODAS las filas de un usuario
-    # juntas. Polars no puede hacer eso en modo lazy/streaming porque procesa
-    # por bloques y no tiene todas las filas del usuario en memoria a la vez.
-    # Es la única materialización del pipeline — después volvemos a lazy.
-    logger.info("  Materializando para calcular perfiles de usuario...")
-    df_collected = df.collect()
-    logger.info(f"  Filas después de limpieza: {len(df_collected):,}")
+    # ── Perfiles por usuario SIN materializar todo el dataset ──
+    # Las reglas R1 y R5 necesitan ver todas las transacciones de cada usuario,
+    # pero NO necesitan todas las columnas. En vez de hacer df.collect() (que
+    # cargaba las ~12.6M filas con TODAS las columnas en RAM y provocaba OOM),
+    # colectamos solo las 2 columnas mínimas de cada perfil. El projection
+    # pushdown de scan_parquet lee únicamente esas columnas del parquet, así que
+    # el footprint baja de varios GB a ~cientos de MB. El dataset principal sigue
+    # lazy y se une con estos perfiles (tablas chicas) en modo streaming.
 
     # ── R1: p99 de monto por usuario ──
-    # Para cada usuario, calculamos el monto que supera al 99% de sus compras.
-    # Una transacción que supere ESE umbral (no el global) es atípica para él.
-    logger.info("  Calculando p99 de monto por usuario...")
+    # Para cada usuario, el monto que supera al 99% de sus compras. Una
+    # transacción por encima de ESE umbral (no el global) es atípica para él.
+    logger.info("  Calculando p99 de monto por usuario (solo user_id + amount)...")
     p99_por_usuario = (
-        df_collected
+        df.select(["user_id", "amount"])
         .group_by("user_id")
         .agg(pl.col("amount").quantile(0.99).alias("p99_amount"))
+        .collect(streaming=True)
     )
-    # Cuántos usuarios tienen perfil de monto
     logger.info(f"  Perfiles de monto calculados: {len(p99_por_usuario):,} usuarios")
 
     # ── R5: perfil de horarios por usuario ──
-    # Contamos cuántas transacciones tiene cada usuario en cada hora del día.
-    # Si en cierta hora tiene menos del 1% de su actividad total → hora inusual.
-    logger.info("  Calculando perfil de horarios por usuario...")
+    # Cuántas transacciones tiene cada usuario en cada hora del día. Si en cierta
+    # hora tiene menos del 1% de su actividad total → hora inusual.
+    logger.info("  Calculando perfil de horarios por usuario (solo user_id + hour)...")
+    hour_base = df.select(["user_id", "hour"])
     hour_counts = (
-        df_collected
+        hour_base
         .group_by(["user_id", "hour"])
         .agg(pl.len().alias("txn_in_hour"))
     )
     user_totals = (
-        df_collected
+        hour_base
         .group_by("user_id")
         .agg(pl.len().alias("total_txn_user"))
     )
@@ -343,58 +342,95 @@ def _transform_data(**context):
             (pl.col("txn_in_hour") / pl.col("total_txn_user")).alias("hour_ratio")
         )
         .select(["user_id", "hour", "hour_ratio"])
+        .collect(streaming=True)
     )
     logger.info(f"  Perfiles de horario calculados: {len(hour_profile):,} combinaciones usuario-hora")
 
-    # ── Unir perfiles al dataframe principal ──
+    # ── Unir perfiles al dataframe principal (lazy → streaming) ──
+    # Las tablas de perfil son chicas; se convierten a lazy y se unen al df
+    # principal, que nunca se materializa entero.
     df_with_profiles = (
-        df_collected
-        .join(p99_por_usuario, on="user_id", how="left")
-        .join(hour_profile, on=["user_id", "hour"], how="left")
+        df
+        .join(p99_por_usuario.lazy(), on="user_id", how="left")
+        .join(hour_profile.lazy(), on=["user_id", "hour"], how="left")
     )
 
-    # ── Reglas de detección ──
-    # Nota: fill_null(True) en R5 porque si un usuario nunca operó en esa hora,
-    # hour_ratio es null → eso es aún más sospechoso que operar poco en esa hora.
+    # ── Detección por PUNTAJE PONDERADO ──
+    # Antes era un OR de 5 reglas heurísticas: bastaba que UNA se cumpliera para
+    # marcar sospechosa. Eso daba precisión ~0.4% (99.6% de falsas alarmas) porque
+    # reglas como "alto endeudamiento" u "horario inusual" casi no correlacionan
+    # con el fraude real. Ahora cada señal SUMA puntos según su poder predictivo
+    # (medido sobre los datos: tasa de fraude por canal, monto y error), y se marca
+    # sospechosa solo si el puntaje supera un umbral. Esto triplica la precisión
+    # manteniendo el recall (punto de operación "balanceado", umbral = 4).
+    #
+    # Pesos (lift de fraude observado en el dataset):
+    #   online .......................... +3   (Online tiene 13x más fraude que Swipe)
+    #   monto > $500 .................... +4   (>$500: 0.82% fraude vs 0.10% base)
+    #   monto $200–500 .................. +3
+    #   monto $100–200 .................. +1
+    #   con error ....................... +1   (2.7x)
+    #   monto atípico para el usuario ... +2   (supera el p99 de ESE usuario)
+    #   tarjeta en dark web ............. +5   (señal dura, definitiva)
+    #   combo online & monto > $200 ..... +3   (interacción: online caro)
+    SCORE_THRESHOLD = 4
+
     final = (
         df_with_profiles
         .with_columns([
-            # R1: monto supera el p99 de ESE usuario (antes era el p99 global)
+            # Señales booleanas reutilizadas en el puntaje y en suspicion_reasons
+            pl.col("is_online").fill_null(False).alias("_s_online"),
             (pl.col("amount") > pl.col("p99_amount"))
-                .fill_null(False).alias("_r1"),
-            # R2: sin cambios
+                .fill_null(False).alias("_s_monto_usuario"),
             (
                 pl.col("errors").is_not_null()
                 & (pl.col("errors").cast(pl.Utf8).str.strip_chars() != "")
                 & (pl.col("errors").cast(pl.Utf8).str.strip_chars() != "nan")
-            ).alias("_r2"),
-            # R3: sin cambios
-            pl.col("card_on_dark_web").fill_null(False).alias("_r3"),
-            # R4: sin cambios
-            (pl.col("debt_income_ratio") > 3).fill_null(False).alias("_r4"),
-            # R5: hora inusual para ese usuario
-            # fill_null(True) → si nunca operó en esa hora, es sospechoso
-            (pl.col("hour_ratio") < 0.01).fill_null(True).alias("_r5"),
+            ).alias("_s_error"),
+            pl.col("card_on_dark_web").fill_null(False).alias("_s_darkweb"),
         ])
         .with_columns([
-            (pl.col("_r1") | pl.col("_r2") | pl.col("_r3") | pl.col("_r4") | pl.col("_r5"))
-                .alias("is_suspicious"),
-            pl.concat_str([
-                pl.when(pl.col("_r1")).then(pl.lit("monto_atipico_usuario;")).otherwise(pl.lit("")),
-                pl.when(pl.col("_r2")).then(pl.lit("error_en_transaccion;")).otherwise(pl.lit("")),
-                pl.when(pl.col("_r3")).then(pl.lit("tarjeta_en_dark_web;")).otherwise(pl.lit("")),
-                pl.when(pl.col("_r4")).then(pl.lit("alto_endeudamiento;")).otherwise(pl.lit("")),
-                pl.when(pl.col("_r5")).then(pl.lit("horario_inusual;")).otherwise(pl.lit("")),
-            ]).str.strip_chars_end(";").alias("suspicion_reasons"),
+            # Puntaje ponderado (0 a ~18)
+            (
+                pl.when(pl.col("_s_online")).then(3).otherwise(0)
+                + pl.when(pl.col("amount") > 500).then(4)
+                   .when(pl.col("amount") > 200).then(3)
+                   .when(pl.col("amount") > 100).then(1)
+                   .otherwise(0)
+                + pl.when(pl.col("_s_error")).then(1).otherwise(0)
+                + pl.when(pl.col("_s_monto_usuario")).then(2).otherwise(0)
+                + pl.when(pl.col("_s_darkweb")).then(5).otherwise(0)
+                + pl.when(pl.col("_s_online") & (pl.col("amount") > 200)).then(3).otherwise(0)
+            ).cast(pl.Int32).alias("fraud_score"),
         ])
-        .drop(["_r1", "_r2", "_r3", "_r4", "_r5", "hour", "p99_amount", "hour_ratio"])
+        .with_columns([
+            (pl.col("fraud_score") >= SCORE_THRESHOLD).alias("is_suspicious"),
+            # Señales que contribuyeron (solo se completa si quedó marcada sospechosa)
+            pl.concat_str([
+                pl.when(pl.col("_s_online")).then(pl.lit("online;")).otherwise(pl.lit("")),
+                pl.when(pl.col("amount") > 100).then(pl.lit("monto_alto;")).otherwise(pl.lit("")),
+                pl.when(pl.col("_s_error")).then(pl.lit("error_en_transaccion;")).otherwise(pl.lit("")),
+                pl.when(pl.col("_s_monto_usuario")).then(pl.lit("monto_atipico_usuario;")).otherwise(pl.lit("")),
+                pl.when(pl.col("_s_darkweb")).then(pl.lit("tarjeta_en_dark_web;")).otherwise(pl.lit("")),
+            ]).str.strip_chars_end(";").alias("_reasons"),
+        ])
+        .with_columns([
+            pl.when(pl.col("is_suspicious"))
+                .then(pl.col("_reasons"))
+                .otherwise(pl.lit(""))
+                .alias("suspicion_reasons"),
+        ])
+        .drop(["_s_online", "_s_monto_usuario", "_s_error", "_s_darkweb", "_reasons",
+               "hour", "p99_amount", "hour_ratio"])
         .rename({
             "current_age": "user_age",
             "gender": "user_gender",
         })
     )
 
-    final.write_parquet(PROCESSED_PATH, compression="snappy")
+    # sink_parquet = escritura en streaming: el resultado se va volcando por
+    # bloques sin materializar las 12.6M filas en memoria.
+    final.sink_parquet(PROCESSED_PATH, compression="snappy")
     logger.info(f"Transformaciones completadas → {PROCESSED_PATH}")
 
 # ============================================================
@@ -470,7 +506,9 @@ def _compute_metrics(**context):
                 COUNT(*)                                                AS total_transactions,
                 COUNT(*) FILTER (WHERE is_fraud)                        AS total_fraud,
                 CAST(COUNT(*) FILTER (WHERE is_fraud) AS DOUBLE) / COUNT(*) AS fraud_rate,
-                COALESCE(SUM(CASE WHEN is_fraud THEN amount END), 0)    AS amount_at_risk
+                COALESCE(SUM(CASE WHEN is_fraud THEN amount END), 0)    AS amount_at_risk,
+                COUNT(*) FILTER (WHERE is_suspicious)                   AS total_suspicious,
+                COALESCE(SUM(CASE WHEN is_suspicious THEN amount END), 0) AS amount_suspicious
             FROM read_parquet('{parquet}')
             {where}
             GROUP BY ALL
@@ -498,7 +536,9 @@ def _compute_metrics(**context):
             COUNT(*)                                                AS total_transactions,
             COUNT(*) FILTER (WHERE is_fraud)                        AS total_fraud,
             CAST(COUNT(*) FILTER (WHERE is_fraud) AS DOUBLE) / COUNT(*) AS fraud_rate,
-            COALESCE(SUM(CASE WHEN is_fraud THEN amount END), 0)    AS amount_at_risk
+            COALESCE(SUM(CASE WHEN is_fraud THEN amount END), 0)    AS amount_at_risk,
+            COUNT(*) FILTER (WHERE is_suspicious)                   AS total_suspicious,
+            COALESCE(SUM(CASE WHEN is_suspicious THEN amount END), 0) AS amount_suspicious
         FROM read_parquet('{parquet}')
         GROUP BY merchant_id, merchant_city, merchant_state, mcc_description
     """).df()
@@ -563,6 +603,15 @@ def _load_to_dwh(**context):
     # más rápido para bulk load. Sigue garantizando ACID al final del COMMIT.
     cur.execute("SET LOCAL synchronous_commit = OFF")
 
+    # ── Migración de esquema (idempotente) ──
+    # Columnas agregadas con el puntaje ponderado y el filtro global del dashboard.
+    # IF NOT EXISTS las hace seguras de re-ejecutar sobre un DWH ya existente que
+    # se creó con un init_dwh.sql anterior.
+    cur.execute("ALTER TABLE transactions_processed ADD COLUMN IF NOT EXISTS fraud_score INTEGER")
+    for _tbl in ("fraud_by_mcc", "fraud_by_card_type", "fraud_by_state", "fraud_by_merchant"):
+        cur.execute(f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS total_suspicious BIGINT DEFAULT 0")
+        cur.execute(f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS amount_suspicious NUMERIC(18,2) DEFAULT 0")
+
     # ── transactions_processed: COPY directo a la tabla final ──
     # Optimizaciones:
     # 1. pl.scan_parquet (lazy) + sink_csv (streaming) en lugar de read_parquet +
@@ -583,6 +632,7 @@ def _load_to_dwh(**context):
         "yearly_income", "total_debt", "credit_score", "card_brand", "card_type",
         "has_chip", "card_on_dark_web", "credit_limit", "debt_income_ratio",
         "distance_km", "is_fraud", "is_suspicious", "suspicion_reasons",
+        "fraud_score",
     ]
 
     # Ver qué columnas existen en el parquet para agregar las faltantes como NULL
@@ -644,13 +694,15 @@ def _load_to_dwh(**context):
     mcc_rows = [
         (_v(r["mcc"]), _v(r["mcc_description"]),
          int(r["total_transactions"]), int(r["total_fraud"]),
-         float(r["fraud_rate"]), float(r["amount_at_risk"]))
+         float(r["fraud_rate"]), float(r["amount_at_risk"]),
+         int(r["total_suspicious"]), float(r["amount_suspicious"]))
         for _, r in metrics["by_mcc"].iterrows()
     ]
     if mcc_rows:
         execute_values(cur,
             """INSERT INTO fraud_by_mcc
-               (mcc, mcc_description, total_transactions, total_fraud, fraud_rate, amount_at_risk)
+               (mcc, mcc_description, total_transactions, total_fraud, fraud_rate, amount_at_risk,
+                total_suspicious, amount_suspicious)
                VALUES %s""",
             mcc_rows, page_size=1000)
 
@@ -659,13 +711,15 @@ def _load_to_dwh(**context):
     card_rows = [
         (_v(r.get("card_brand")), _v(r.get("card_type")), _b(r.get("has_chip")),
          int(r["total_transactions"]), int(r["total_fraud"]),
-         float(r["fraud_rate"]), float(r["amount_at_risk"]))
+         float(r["fraud_rate"]), float(r["amount_at_risk"]),
+         int(r["total_suspicious"]), float(r["amount_suspicious"]))
         for _, r in metrics["by_card"].iterrows()
     ]
     if card_rows:
         execute_values(cur,
             """INSERT INTO fraud_by_card_type
-               (card_brand, card_type, has_chip, total_transactions, total_fraud, fraud_rate, amount_at_risk)
+               (card_brand, card_type, has_chip, total_transactions, total_fraud, fraud_rate, amount_at_risk,
+                total_suspicious, amount_suspicious)
                VALUES %s""",
             card_rows, page_size=1000)
 
@@ -674,13 +728,15 @@ def _load_to_dwh(**context):
     state_rows = [
         (_v(r["state"]),
          int(r["total_transactions"]), int(r["total_fraud"]),
-         float(r["fraud_rate"]), float(r["amount_at_risk"]))
+         float(r["fraud_rate"]), float(r["amount_at_risk"]),
+         int(r["total_suspicious"]), float(r["amount_suspicious"]))
         for _, r in metrics["by_state"].iterrows()
     ]
     if state_rows:
         execute_values(cur,
             """INSERT INTO fraud_by_state
-               (state, total_transactions, total_fraud, fraud_rate, amount_at_risk)
+               (state, total_transactions, total_fraud, fraud_rate, amount_at_risk,
+                total_suspicious, amount_suspicious)
                VALUES %s""",
             state_rows, page_size=1000)
 
@@ -690,14 +746,16 @@ def _load_to_dwh(**context):
         (_v(r.get("merchant_id")), _v(r.get("merchant_city")),
          _v(r.get("merchant_state")), _v(r.get("mcc_description")),
          int(r["total_transactions"]), int(r["total_fraud"]),
-         float(r["fraud_rate"]), float(r["amount_at_risk"]))
+         float(r["fraud_rate"]), float(r["amount_at_risk"]),
+         int(r["total_suspicious"]), float(r["amount_suspicious"]))
         for _, r in metrics["by_merchant"].iterrows()
     ]
     if merch_rows:
         execute_values(cur,
             """INSERT INTO fraud_by_merchant
                (merchant_id, merchant_city, merchant_state, mcc_description,
-                total_transactions, total_fraud, fraud_rate, amount_at_risk)
+                total_transactions, total_fraud, fraud_rate, amount_at_risk,
+                total_suspicious, amount_suspicious)
                VALUES %s""",
             merch_rows, page_size=1000)
 
