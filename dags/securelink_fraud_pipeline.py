@@ -831,7 +831,7 @@ def _quality_check(**context):
 with DAG(
     dag_id="securelink_fraud_pipeline",
     start_date=datetime(2024, 1, 1),
-    schedule="@daily",
+    schedule=None,
     catchup=False,
     default_args=default_args,
     tags=["securelink", "fraude", "etl"],
