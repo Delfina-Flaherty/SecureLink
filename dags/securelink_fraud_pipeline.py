@@ -459,7 +459,7 @@ def _compute_metrics(**context):
                 MIN(transaction_date)::DATE AS start_dt,
                 MAX(transaction_date)::DATE AS end_dt,
                 COUNT(*) FILTER (WHERE is_suspicious AND is_fraud) AS tp_count,
-                COUNT(*) FILTER (WHERE NOT is_suspicious AND NOT is_fraud) AS tn_count,
+                COUNT(*) FILTER (WHERE NOT is_suspicious AND NOT is_fraud) AS tn_count
             FROM read_parquet('{parquet}')
         )
         SELECT
@@ -669,14 +669,21 @@ def _load_to_dwh(**context):
     g = metrics["global"]
     cur.execute("TRUNCATE TABLE fraud_metrics_global")
     cur.execute("""
-        INSERT INTO fraud_metrics_global (total_transactions, total_fraud, fraud_rate,
-            total_amount_at_risk, avg_fraud_amount, false_positive_rate, false_negative_rate,
+        INSERT INTO fraud_metrics_global (
+            total_transactions, total_fraud, fraud_rate,
+            total_amount_at_risk, avg_fraud_amount, 
+            false_positive_rate, false_negative_rate,
+            true_positives, true_negatives, false_positives, false_negatives,
             dataset_start_date, dataset_end_date)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (g["total_transactions"], g["total_fraud"], g["fraud_rate"],
-          g["total_amount_at_risk"], g["avg_fraud_amount"],
-          g["false_positive_rate"], g["false_negative_rate"],
-          g["dataset_start_date"], g["dataset_end_date"]))
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        g["total_transactions"], g["total_fraud"], g["fraud_rate"],
+        g["total_amount_at_risk"], g["avg_fraud_amount"],
+        g["false_positive_rate"], g["false_negative_rate"],
+        g["true_positives"], g["true_negatives"],
+        g["false_positives"], g["false_negatives"],
+        g["dataset_start_date"], g["dataset_end_date"]
+    ))
 
     # ── Helper para limpiar valores NaN/None ──
     def _v(val, cast=None):
