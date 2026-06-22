@@ -36,7 +36,7 @@ DWH_CONN = "postgres_dwh"
 REF_USERS_PATH    = "/tmp/securelink_ref_users.parquet"
 REF_CARDS_PATH    = "/tmp/securelink_ref_cards.parquet"
 REF_MCC_PATH      = "/tmp/securelink_ref_mcc.pkl"
-REF_LABELS_PATH   = "/tmp/securelink_ref_labels.pkl"
+REF_LABELS_PATH   = "/tmp/securelink_ref_labels.parquet"
 MERGED_PATH       = "/tmp/securelink_merged.parquet"
 PROCESSED_PATH    = "/tmp/securelink_processed.parquet"
 METRICS_PATH      = "/tmp/securelink_metrics.pkl"
@@ -121,15 +121,36 @@ def _load_mcc(**context):
 
 
 def _load_labels(**context):
+    """Lee train_fraud_labels.json (8.9M entradas) y lo escribe como Parquet.
+
+    Optimizado para no hacer OOM en máquinas con poca RAM: la versión anterior
+    construía DOS diccionarios completos en memoria (el de json.load ~1.3 GB +
+    el de la comprehension ~1.3 GB = ~2.6 GB de pico) y los serializaba con
+    pickle. Acá construimos dos listas (claves y flags) directamente, liberamos
+    el dict crudo antes de armar el DataFrame, y guardamos en Parquet columnar
+    (más compacto que el pickle y se lee con projection pushdown). Pico ~700 MB.
+    """
     logger.info("=== TAREA 2d: Leyendo train_fraud_labels.json ===")
+    import polars as pl
+
     # JSON anidado {"target": {"txn_id": "Yes"/"No", ...}}
     with open(LABELS_FILE, "r") as f:
         labels_raw = json.load(f)
     labels_inner = labels_raw.get("target", labels_raw)
-    labels_dict = {str(k): (v == "Yes") for k, v in labels_inner.items()}
-    with open(REF_LABELS_PATH, "wb") as f:
-        pickle.dump(labels_dict, f)
-    logger.info(f"  Labels: {len(labels_dict):,} registros → {REF_LABELS_PATH}")
+
+    # Materializar claves y flags en listas (los strings ya existen en labels_raw;
+    # las listas solo guardan referencias). v == "Yes" usa los bool cacheados.
+    ids = list(labels_inner.keys())
+    flags = [v == "Yes" for v in labels_inner.values()]
+    # Liberar el dict crudo (~1.3 GB) antes de construir el DataFrame.
+    # Los strings de las claves siguen vivos porque los referencia `ids`.
+    del labels_raw, labels_inner
+
+    pl.DataFrame(
+        {"transaction_id": ids, "is_fraud": flags},
+        schema={"transaction_id": pl.Utf8, "is_fraud": pl.Boolean},
+    ).write_parquet(REF_LABELS_PATH, compression="snappy")
+    logger.info(f"  Labels: {len(ids):,} registros → {REF_LABELS_PATH}")
 
 
 # ============================================================
@@ -164,20 +185,17 @@ def _ingest_transactions(**context):
     cards = pl.read_parquet(REF_CARDS_PATH)
     with open(REF_MCC_PATH, "rb") as f:
         mcc_lookup = pickle.load(f)
-    with open(REF_LABELS_PATH, "rb") as f:
-        labels_dict = pickle.load(f)
 
-    # ── Convertir dicts a DataFrames Polars para hash joins eficientes ──
+    # Labels ya viene como Parquet (transaction_id, is_fraud) desde _load_labels.
+    # Se lee directo, sin reconstruir el dict de 8.9M entradas en RAM (eso era
+    # otro punto de OOM en la versión anterior).
+    labels_df = pl.read_parquet(REF_LABELS_PATH)
+
+    # ── Convertir el dict de MCC (chico, ~900 entradas) a DataFrame ──
     mcc_df = pl.DataFrame({
         "mcc": [str(k) for k in mcc_lookup.keys()],
         "mcc_description": list(mcc_lookup.values()),
     })
-    labels_df = pl.DataFrame({
-        "transaction_id": [str(k) for k in labels_dict.keys()],
-        "is_fraud": list(labels_dict.values()),
-    })
-    # liberar dicts grandes ahora que ya están en polars
-    del labels_dict
     del mcc_lookup
 
     logger.info(f"  Referencias: users={len(users):,}, cards={len(cards):,}, "
