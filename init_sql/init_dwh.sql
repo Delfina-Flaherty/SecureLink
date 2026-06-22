@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS fraud_metrics_global (
     avg_fraud_amount            NUMERIC(12, 2),
     false_positive_rate         NUMERIC(8, 4),
     false_negative_rate         NUMERIC(8, 4),
+    -- Matriz de confusión
+    true_positives              INTEGER,
+    true_negatives              INTEGER,
+    false_positives             INTEGER,
+    false_negatives             INTEGER,
     -- Dataset info
     dataset_start_date          DATE,
     dataset_end_date            DATE
