@@ -670,7 +670,32 @@ def _load_to_dwh(**context):
     )
     logger.info(f"  CSV escrito → {COPY_CSV_PATH}. Ejecutando COPY...")
 
-    # COPY directo a la tabla final
+    # ── Optimización del bulk load: DROP índices → COPY → CREATE índices ──
+    # Mantener los 6 índices secundarios actualizados fila por fila durante el
+    # COPY de 12.6M filas es el mayor costo de esta tarea (~22 min de los ~28).
+    # Crear cada índice de una vez al final es mucho más rápido que el
+    # mantenimiento incremental. El PK (transaction_id) se mantiene durante el
+    # COPY (dropearlo es más riesgoso y aporta menos).
+    #
+    # DDL de los índices secundarios — DROP y CREATE en sync desde la misma lista.
+    secondary_indexes = [
+        ("idx_txn_date",      "transactions_processed (transaction_date)"),
+        ("idx_txn_user_id",   "transactions_processed (user_id)"),
+        ("idx_txn_is_fraud",  "transactions_processed (is_fraud)"),
+        ("idx_txn_type",      "transactions_processed (transaction_type)"),
+        ("idx_txn_merchant",  "transactions_processed (merchant_id)"),
+        ("idx_txn_user_date", "transactions_processed (user_id, transaction_date DESC)"),
+    ]
+
+    # maintenance_work_mem alto acelera la creación de índices (default 64MB).
+    # 256MB es seguro para máquinas de 8GB y mejora notablemente el CREATE INDEX.
+    cur.execute("SET maintenance_work_mem = '256MB'")
+
+    logger.info("  Borrando índices secundarios antes del COPY...")
+    for idx_name, _ in secondary_indexes:
+        cur.execute(f"DROP INDEX IF EXISTS {idx_name}")
+
+    # COPY directo a la tabla final (solo el PK se mantiene durante la carga)
     cur.execute("TRUNCATE TABLE transactions_processed")
     with open(COPY_CSV_PATH, "r") as f:
         cur.copy_expert(
@@ -681,7 +706,12 @@ def _load_to_dwh(**context):
     os.remove(COPY_CSV_PATH)
     # cur.rowcount tras COPY trae las filas insertadas
     total_rows = cur.rowcount
-    logger.info(f"  COPY completado: {total_rows:,} filas en transactions_processed")
+    logger.info(f"  COPY completado: {total_rows:,} filas. Recreando índices...")
+
+    # Recrear los índices de una vez (mucho más rápido que mantenerlos en el COPY)
+    for idx_name, idx_def in secondary_indexes:
+        cur.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {idx_def}")
+    logger.info("  Índices recreados.")
 
     # ── Métricas globales ──
     g = metrics["global"]

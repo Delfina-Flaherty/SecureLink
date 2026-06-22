@@ -33,6 +33,21 @@ services:
       POSTGRES_USER: dwh
       POSTGRES_PASSWORD: dwh123
       POSTGRES_DB: securelink
+    # Tuning para acelerar el bulk load y las queries del dashboard. Los valores
+    # por defecto de Postgres son muy conservadores (shared_buffers=128MB).
+    # Estos están dimensionados para una máquina de ~8GB; si tu Docker tiene
+    # menos RAM asignada, bajá shared_buffers a 256MB.
+    #   shared_buffers=1GB        cache de páginas en RAM (default 128MB)
+    #   work_mem=64MB             memoria por operación de sort/hash (queries del dashboard)
+    #   maintenance_work_mem=256MB  acelera CREATE INDEX en load_to_dwh
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=1GB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "maintenance_work_mem=256MB"
     volumes:
       - postgres_dwh_data:/var/lib/postgresql/data
       - ./init_sql/init_dwh.sql:/docker-entrypoint-initdb.d/01_init.sql
