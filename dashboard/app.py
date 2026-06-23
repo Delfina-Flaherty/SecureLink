@@ -58,7 +58,8 @@ st.sidebar.caption("Sistema de detección de fraude")
 
 pagina = st.sidebar.radio(
     "Navegar a:",
-    ["Panel General", "Panel de Usuario", "Panel de Comercios", "Análisis de Datasets"]
+    ["Panel General", "Panel de Usuario", "Panel de Comercios",
+     "Explorador con Filtros", "Análisis de Datasets"]
 )
 
 # Info de la última corrida del pipeline (en sidebar)
@@ -1025,6 +1026,41 @@ elif pagina == "Panel de Usuario":
                     "tuvieron fraudes (más oscuro = más fraudes en esa categoría)."
                 )
 
+        # ── RF13: mapa geográfico de las transacciones del usuario ──
+        st.divider()
+        st.subheader("🗺️ Mapa de transacciones del usuario")
+        st.caption(
+            "Distribución geográfica de las transacciones presenciales del usuario "
+            "por estado de EEUU (las Online no tienen ubicación). Color = cantidad "
+            "de transacciones; útil para ver si opera lejos de su zona habitual."
+        )
+        geo_user = query("""
+            SELECT merchant_state AS state,
+                   COUNT(*) AS txns,
+                   COUNT(*) FILTER (WHERE is_fraud) AS fraudes
+            FROM transactions_processed
+            WHERE user_id = :user_id
+              AND merchant_state IS NOT NULL AND merchant_state != ''
+              AND LENGTH(merchant_state) = 2
+            GROUP BY merchant_state
+        """, {"user_id": str(user_id)})
+        if geo_user is not None and not geo_user.empty:
+            geo_us = geo_user[geo_user["state"].isin(US_STATES)]
+            if not geo_us.empty:
+                fig = px.choropleth(
+                    geo_us, locations="state", locationmode="USA-states",
+                    color="txns", scope="usa", color_continuous_scale="Blues",
+                    hover_data={"fraudes": ":,"},
+                    labels={"txns": "Transacciones"},
+                    title="Transacciones del usuario por estado",
+                )
+                fig.update_layout(height=420, margin=dict(t=50, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("El usuario no tiene transacciones presenciales en estados de EEUU (posiblemente solo opera Online).")
+        else:
+            st.info("Sin datos geográficos para este usuario (puede operar solo Online).")
+
     # ── TAB: HISTORIAL ──
     with tab_hist:
         st.subheader("Historial de transacciones (últimas 100)")
@@ -1264,6 +1300,128 @@ elif pagina == "Panel de Comercios":
             "(mayor tasa de fraude) son las más críticas — combinan volumen alto con "
             "alta probabilidad de fraude en cada transacción."
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EXPLORADOR CON FILTROS (RF16)
+# ═══════════════════════════════════════════════════════════════════════════
+elif pagina == "Explorador con Filtros":
+    st.title("🔎 Explorador de transacciones")
+    st.caption(
+        "Aplicá filtros combinados sobre el detalle de transacciones: usuario, "
+        "tarjeta, tipo, categoría de comercio (MCC), estado y rango de fechas. "
+        "Los filtros se aplican sobre la tabla `transactions_processed`."
+    )
+
+    # ── Rango de fechas disponible (para los defaults del filtro) ──
+    # Lo tomamos de fraud_metrics_global (dataset_start/end_date), evitando un
+    # MIN/MAX sobre las 12.6M filas.
+    rango = query("""
+        SELECT dataset_start_date AS dmin, dataset_end_date AS dmax
+        FROM fraud_metrics_global ORDER BY computed_at DESC LIMIT 1
+    """)
+    import datetime as _dt
+    if rango is not None and not rango.empty and rango.iloc[0]["dmin"] is not None:
+        dmin = rango.iloc[0]["dmin"]
+        dmax = rango.iloc[0]["dmax"]
+    else:
+        dmin, dmax = _dt.date(2010, 1, 1), _dt.date(2019, 12, 31)
+
+    # ── Opciones para los selectores ──
+    mcc_opts = query("""
+        SELECT DISTINCT mcc_description FROM fraud_by_mcc
+        WHERE mcc_description IS NOT NULL AND mcc_description != 'Unknown'
+        ORDER BY mcc_description
+    """)
+    mcc_list = ["(todas)"] + (mcc_opts["mcc_description"].tolist() if mcc_opts is not None and not mcc_opts.empty else [])
+    estados_list = ["(todos)"] + sorted(US_STATES)
+
+    # ── Widgets de filtro ──
+    st.subheader("Filtros")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        f_user = st.text_input("ID de usuario", placeholder="ej: 1102").strip()
+        f_card = st.text_input("ID de tarjeta", placeholder="ej: 2972").strip()
+    with c2:
+        f_tipo = st.selectbox("Tipo de transacción", ["(todas)", "Online", "Swipe"])
+        f_mcc = st.selectbox("Categoría (MCC)", mcc_list)
+    with c3:
+        f_estado = st.selectbox("Estado (EEUU)", estados_list)
+        f_marca = st.selectbox("Marca de tarjeta", ["(todas)", "Visa", "Mastercard", "Amex", "Discover"])
+
+    f_fechas = st.date_input(
+        "Rango de fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax,
+    )
+    solo_fraude = st.checkbox("Mostrar solo transacciones fraudulentas (is_fraud)")
+    solo_sosp = st.checkbox("Mostrar solo sospechosas según las reglas (is_suspicious)")
+
+    # ── Construcción dinámica del WHERE con bind params ──
+    conds, params = [], {}
+    if f_user:
+        conds.append("user_id = :user"); params["user"] = f_user
+    if f_card:
+        conds.append("card_id = :card"); params["card"] = f_card
+    if f_tipo != "(todas)":
+        conds.append("transaction_type = :tipo"); params["tipo"] = f_tipo
+    if f_mcc != "(todas)":
+        conds.append("mcc_description = :mcc"); params["mcc"] = f_mcc
+    if f_estado != "(todos)":
+        conds.append("merchant_state = :estado"); params["estado"] = f_estado
+    if f_marca != "(todas)":
+        conds.append("card_brand = :marca"); params["marca"] = f_marca
+    if isinstance(f_fechas, (tuple, list)) and len(f_fechas) == 2:
+        conds.append("transaction_date >= :d1 AND transaction_date < (:d2::date + 1)")
+        params["d1"] = str(f_fechas[0]); params["d2"] = str(f_fechas[1])
+    if solo_fraude:
+        conds.append("is_fraud = TRUE")
+    if solo_sosp:
+        conds.append("is_suspicious = TRUE")
+
+    where_sql = ("WHERE " + " AND ".join(conds)) if conds else ""
+
+    if not conds:
+        st.info(
+            "Aplicá al menos un filtro para explorar. Sin filtros, la consulta "
+            "recorrería las 12.6M de transacciones y sería lenta."
+        )
+        st.stop()
+
+    # ── Métricas del subconjunto filtrado ──
+    resumen = query(f"""
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE is_fraud) AS fraude,
+               COUNT(*) FILTER (WHERE is_suspicious) AS sospechosas,
+               COALESCE(SUM(amount), 0) AS monto_total,
+               COALESCE(SUM(amount) FILTER (WHERE is_fraud), 0) AS monto_fraude
+        FROM transactions_processed
+        {where_sql}
+    """, params)
+
+    if resumen is not None and not resumen.empty:
+        r = resumen.iloc[0]
+        st.divider()
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Transacciones", f"{int(r['total']):,}")
+        m2.metric("Fraudes (reales)", f"{int(r['fraude']):,}")
+        m3.metric("Sospechosas (reglas)", f"{int(r['sospechosas']):,}")
+        m4.metric("Monto en riesgo", f"${float(r['monto_fraude']):,.0f}")
+
+    # ── Tabla de detalle (primeras 500 filas) ──
+    st.subheader("Detalle (primeras 500 transacciones)")
+    detalle = query(f"""
+        SELECT transaction_id, transaction_date, user_id, card_id, amount,
+               transaction_type, merchant_city, merchant_state, mcc_description,
+               card_brand, distance_km, is_fraud, is_suspicious, fraud_score,
+               suspicion_reasons
+        FROM transactions_processed
+        {where_sql}
+        ORDER BY transaction_date DESC
+        LIMIT 500
+    """, params)
+    if detalle is not None and not detalle.empty:
+        st.dataframe(detalle, use_container_width=True, height=460, hide_index=True)
+    else:
+        st.warning("No hay transacciones que cumplan los filtros seleccionados.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
