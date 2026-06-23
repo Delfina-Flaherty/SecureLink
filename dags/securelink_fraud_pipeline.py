@@ -49,6 +49,43 @@ default_args = {
     "max_retry_delay": timedelta(minutes=5),
 }
 
+# Centroides geográficos (lat, lon) de los 50 estados de EEUU + DC.
+# El dataset de transacciones trae merchant_state (2 letras) pero NO coordenadas
+# del comercio. Para calcular la distancia geográfica usuario↔comercio (RF06) y
+# la regla de distancia inusual (RF08), aproximamos la ubicación del comercio al
+# centroide de su estado. Es una aproximación a nivel estado (no la dirección
+# exacta del comercio), suficiente para detectar transacciones lejanas al
+# domicilio del usuario. Las transacciones Online no tienen merchant_state, así
+# que su distancia queda en null (RF18).
+STATE_CENTROIDS = {
+    "AL": (32.806671, -86.791130), "AK": (61.370716, -152.404419),
+    "AZ": (33.729759, -111.431221), "AR": (34.969704, -92.373123),
+    "CA": (36.116203, -119.681564), "CO": (39.059811, -105.311104),
+    "CT": (41.597782, -72.755371),  "DE": (39.318523, -75.507141),
+    "DC": (38.897438, -77.026817),  "FL": (27.766279, -81.686783),
+    "GA": (33.040619, -83.643074),  "HI": (21.094318, -157.498337),
+    "ID": (44.240459, -114.478828), "IL": (40.349457, -88.986137),
+    "IN": (39.849426, -86.258278),  "IA": (42.011539, -93.210526),
+    "KS": (38.526600, -96.726486),  "KY": (37.668140, -84.670067),
+    "LA": (31.169546, -91.867805),  "ME": (44.693947, -69.381927),
+    "MD": (39.063946, -76.802101),  "MA": (42.230171, -71.530106),
+    "MI": (43.326618, -84.536095),  "MN": (45.694454, -93.900192),
+    "MS": (32.741646, -89.678696),  "MO": (38.456085, -92.288368),
+    "MT": (46.921925, -110.454353), "NE": (41.125370, -98.268082),
+    "NV": (38.313515, -117.055374), "NH": (43.452492, -71.563896),
+    "NJ": (40.298904, -74.521011),  "NM": (34.840515, -106.248482),
+    "NY": (42.165726, -74.948051),  "NC": (35.630066, -79.806419),
+    "ND": (47.528912, -99.784012),  "OH": (40.388783, -82.764915),
+    "OK": (35.565342, -96.928917),  "OR": (44.572021, -122.070938),
+    "PA": (40.590752, -77.209755),  "RI": (41.680893, -71.511780),
+    "SC": (33.856892, -80.945007),  "SD": (44.299782, -99.438828),
+    "TN": (35.747845, -86.692345),  "TX": (31.054487, -97.563461),
+    "UT": (40.150032, -111.862434), "VT": (44.045876, -72.710686),
+    "VA": (37.769337, -78.169968),  "WA": (47.400902, -121.490494),
+    "WV": (38.491226, -80.954453),  "WI": (44.268543, -89.616508),
+    "WY": (42.755966, -107.302490),
+}
+
 
 # ============================================================
 # TAREA 1: Validar archivos
@@ -307,7 +344,6 @@ def _transform_data(**context):
             .then(pl.col("total_debt") / pl.col("yearly_income"))
             .otherwise(None)
             .alias("debt_income_ratio"),
-        pl.lit(None).cast(pl.Float64).alias("distance_km"),
         # Hora de la transacción — necesaria para R5
         pl.col("transaction_date").dt.hour().alias("hour"),
     ]).with_columns([
@@ -316,6 +352,27 @@ def _transform_data(**context):
             .otherwise(pl.lit("Swipe"))
             .alias("transaction_type"),
     ])
+
+    # ── RF06: distancia geográfica usuario ↔ comercio (Haversine) ──
+    # Mapeamos merchant_state → centroide del estado (lat/lon) y calculamos la
+    # distancia desde el domicilio del usuario (latitude/longitude). Online no
+    # tiene merchant_state → distance_km queda null (RF18).
+    centroids_df = pl.DataFrame({
+        "merchant_state": list(STATE_CENTROIDS.keys()),
+        "_m_lat": [v[0] for v in STATE_CENTROIDS.values()],
+        "_m_lon": [v[1] for v in STATE_CENTROIDS.values()],
+    })
+    df = df.join(centroids_df.lazy(), on="merchant_state", how="left")
+    # Haversine (R=6371 km). Si falta lat/lon de usuario o de comercio → null.
+    _R = 6371.0
+    _lat1 = pl.col("latitude").cast(pl.Float64).radians()
+    _lat2 = pl.col("_m_lat").radians()
+    _dlat = (pl.col("_m_lat") - pl.col("latitude").cast(pl.Float64)).radians()
+    _dlon = (pl.col("_m_lon") - pl.col("longitude").cast(pl.Float64)).radians()
+    _a = (_dlat / 2).sin() ** 2 + _lat1.cos() * _lat2.cos() * (_dlon / 2).sin() ** 2
+    df = df.with_columns(
+        (2 * _R * _a.sqrt().arcsin()).alias("distance_km")
+    ).drop(["_m_lat", "_m_lon"])
 
     # ── Perfiles por usuario SIN materializar todo el dataset ──
     # Las reglas R1 y R5 necesitan ver todas las transacciones de cada usuario,
@@ -364,6 +421,18 @@ def _transform_data(**context):
     )
     logger.info(f"  Perfiles de horario calculados: {len(hour_profile):,} combinaciones usuario-hora")
 
+    # ── RF06: frecuencia de transacciones por tarjeta ──
+    # Cantidad total de transacciones de cada card_id. Indicador derivado que
+    # también sirve para detectar tarjetas con uso anómalo.
+    logger.info("  Calculando frecuencia de transacciones por tarjeta (solo card_id)...")
+    card_freq = (
+        df.select(["card_id"])
+        .group_by("card_id")
+        .agg(pl.len().alias("card_txn_count"))
+        .collect(streaming=True)
+    )
+    logger.info(f"  Frecuencia por tarjeta calculada: {len(card_freq):,} tarjetas")
+
     # ── Unir perfiles al dataframe principal (lazy → streaming) ──
     # Las tablas de perfil son chicas; se convierten a lazy y se unen al df
     # principal, que nunca se materializa entero.
@@ -371,6 +440,7 @@ def _transform_data(**context):
         df
         .join(p99_por_usuario.lazy(), on="user_id", how="left")
         .join(hour_profile.lazy(), on=["user_id", "hour"], how="left")
+        .join(card_freq.lazy(), on="card_id", how="left")
     )
 
     # ── Detección por PUNTAJE PONDERADO ──
@@ -391,7 +461,9 @@ def _transform_data(**context):
     #   monto atípico para el usuario ... +2   (supera el p99 de ESE usuario)
     #   tarjeta en dark web ............. +5   (señal dura, definitiva)
     #   combo online & monto > $200 ..... +3   (interacción: online caro)
+    #   distancia geográfica inusual .... +2   (RF08: comercio a >500km del domicilio)
     SCORE_THRESHOLD = 4
+    DISTANCE_THRESHOLD_KM = 500  # transacción presencial lejos del domicilio
 
     final = (
         df_with_profiles
@@ -406,9 +478,13 @@ def _transform_data(**context):
                 & (pl.col("errors").cast(pl.Utf8).str.strip_chars() != "nan")
             ).alias("_s_error"),
             pl.col("card_on_dark_web").fill_null(False).alias("_s_darkweb"),
+            # RF08: distancia geográfica inusual (solo aplica a presenciales con
+            # distancia calculada; online no tiene distancia → no dispara)
+            (pl.col("distance_km") > DISTANCE_THRESHOLD_KM)
+                .fill_null(False).alias("_s_distancia"),
         ])
         .with_columns([
-            # Puntaje ponderado (0 a ~18)
+            # Puntaje ponderado (0 a ~20)
             (
                 pl.when(pl.col("_s_online")).then(3).otherwise(0)
                 + pl.when(pl.col("amount") > 500).then(4)
@@ -419,6 +495,7 @@ def _transform_data(**context):
                 + pl.when(pl.col("_s_monto_usuario")).then(2).otherwise(0)
                 + pl.when(pl.col("_s_darkweb")).then(5).otherwise(0)
                 + pl.when(pl.col("_s_online") & (pl.col("amount") > 200)).then(3).otherwise(0)
+                + pl.when(pl.col("_s_distancia")).then(2).otherwise(0)
             ).cast(pl.Int32).alias("fraud_score"),
         ])
         .with_columns([
@@ -430,6 +507,7 @@ def _transform_data(**context):
                 pl.when(pl.col("_s_error")).then(pl.lit("error_en_transaccion;")).otherwise(pl.lit("")),
                 pl.when(pl.col("_s_monto_usuario")).then(pl.lit("monto_atipico_usuario;")).otherwise(pl.lit("")),
                 pl.when(pl.col("_s_darkweb")).then(pl.lit("tarjeta_en_dark_web;")).otherwise(pl.lit("")),
+                pl.when(pl.col("_s_distancia")).then(pl.lit("distancia_inusual;")).otherwise(pl.lit("")),
             ]).str.strip_chars_end(";").alias("_reasons"),
         ])
         .with_columns([
@@ -438,8 +516,8 @@ def _transform_data(**context):
                 .otherwise(pl.lit(""))
                 .alias("suspicion_reasons"),
         ])
-        .drop(["_s_online", "_s_monto_usuario", "_s_error", "_s_darkweb", "_reasons",
-               "hour", "p99_amount", "hour_ratio"])
+        .drop(["_s_online", "_s_monto_usuario", "_s_error", "_s_darkweb", "_s_distancia",
+               "_reasons", "hour", "p99_amount", "hour_ratio"])
         .rename({
             "current_age": "user_age",
             "gender": "user_gender",
@@ -626,6 +704,7 @@ def _load_to_dwh(**context):
     # IF NOT EXISTS las hace seguras de re-ejecutar sobre un DWH ya existente que
     # se creó con un init_dwh.sql anterior.
     cur.execute("ALTER TABLE transactions_processed ADD COLUMN IF NOT EXISTS fraud_score INTEGER")
+    cur.execute("ALTER TABLE transactions_processed ADD COLUMN IF NOT EXISTS card_txn_count INTEGER")
     for _tbl in ("fraud_by_mcc", "fraud_by_card_type", "fraud_by_state", "fraud_by_merchant"):
         cur.execute(f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS total_suspicious BIGINT DEFAULT 0")
         cur.execute(f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS amount_suspicious NUMERIC(18,2) DEFAULT 0")
@@ -656,7 +735,7 @@ def _load_to_dwh(**context):
         "yearly_income", "total_debt", "credit_score", "card_brand", "card_type",
         "has_chip", "card_on_dark_web", "credit_limit", "debt_income_ratio",
         "distance_km", "is_fraud", "is_suspicious", "suspicion_reasons",
-        "fraud_score",
+        "fraud_score", "card_txn_count",
     ]
 
     # Ver qué columnas existen en el parquet para agregar las faltantes como NULL

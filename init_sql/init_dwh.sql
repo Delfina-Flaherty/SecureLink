@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS transactions_processed (
     credit_limit        NUMERIC(12, 2),
     -- Indicadores derivados
     debt_income_ratio   NUMERIC(8, 4),
-    distance_km         NUMERIC(10, 2),
+    distance_km         NUMERIC(10, 2),   -- distancia domicilio usuario ↔ comercio (Haversine)
+    card_txn_count      INTEGER,          -- frecuencia de transacciones de la tarjeta
     -- Etiqueta real de fraude
     is_fraud            BOOLEAN,
     -- Resultado de la detección por puntaje ponderado
