@@ -62,10 +62,10 @@ El DWH (Data Warehouse / almacén de datos) arranca **vacío** — sin este paso
 1. Abrir http://localhost:8080 (usuario `admin`, contraseña `admin`).
 2. En la lista de DAGs, despausar `securelink_fraud_pipeline` (toggle a la izquierda).
 3. Click en ▶️ **Trigger DAG**.
-4. Esperar a que termine. Duraciones típicas:
-   - **PC moderna (16 GB RAM, SSD)**: 3–8 minutos
-   - **PC modesta (8 GB RAM, SSD)**: 8–20 minutos
-   - **PC justa (4-6 GB RAM)**: 30–90 minutos (puede haber swap; ver [Troubleshooting avanzado](#troubleshooting-avanzado-problemas-de-memoria))
+4. Esperar a que termine. Duraciones típicas (el grueso es `load_to_dwh`, ver [benchmark](#por-qué-polars--duckdb-y-no-pandas-para-todo-el-pipeline)):
+   - **PC con 8 GB de RAM, SSD, sin uso concurrente**: ~37 minutos (medido)
+   - **PC con 16 GB RAM**: algo menos, el COPY se acelera con más cache
+   - **PC justa (4-6 GB RAM) o usada al mismo tiempo**: 1-2+ horas por el swap a disco (ver [Troubleshooting avanzado](#troubleshooting-avanzado-problemas-de-memoria))
 
    Podés ver el progreso en la vista Graph (click en el DAG → Graph).
 5. Cuando todas las tareas están en verde (`success`), el DWH ya tiene los datos.
@@ -356,6 +356,23 @@ La primera versión del pipeline usaba pandas en todas las tareas. Funcionaba pe
 | `compute_metrics` | `defaultdict` + pandas `groupby` por chunk en Python | DuckDB SQL vectorizado directo sobre el parquet | ~10-50x |
 | `load_to_dwh` (transacciones) | `execute_values` con `INSERT ... ON CONFLICT` | `COPY ... FROM STDIN` con CSV streaming desde Polars | ~5-10x |
 | `load_to_dwh` (agregadas) | `cursor.execute()` fila por fila en loop | `execute_values` con batches de 1000 | ~50-100x |
+
+**Benchmark medido** (corrida limpia end-to-end, PC con 8 GB de RAM asignados a Docker, sin uso concurrente):
+
+| Tarea | Duración | Notas |
+|---|---|---|
+| validate + load_users/cards/mcc | < 1 min | Paralelo |
+| `load_labels` | 2 min | Parquet en vez de pickle-dict (evita OOM) |
+| `ingest_transactions` | 3.8 min | Polars lazy/streaming + 4 joins |
+| `transform_data` | 2.9 min | Limpieza + features + detección por puntaje |
+| `compute_metrics` | 0.4 min | DuckDB |
+| `load_to_dwh` | 24.4 min | COPY de 12.6M filas (el cuello de botella, ~66% del total) |
+| `quality_check` | 1.6 min | |
+| **TOTAL** | **~37 min** | |
+
+`load_to_dwh` domina el tiempo (cargar 12.6M filas en PostgreSQL con sus índices es el piso de este hardware). El tuning de Postgres (`shared_buffers=1GB` en `docker-compose.yml`) ayuda al COPY. Se evaluó la estrategia *DROP índices → COPY → CREATE índices* pero resultó más lenta (recrear 6 índices sobre 12.6M filas cuesta más que lo que ahorra el COPY), así que se mantiene el COPY directo.
+
+> **Nota sobre tiempos**: el tiempo total varía mucho según la RAM y el uso concurrente de la máquina. En una PC de 4-6 GB usada para otras cosas al mismo tiempo, el pipeline puede tardar 2+ horas por el swap a disco. El benchmark de arriba es el caso limpio. Para desarrollo en máquinas chicas conviene procesar una muestra del dataset.
 
 **Por qué Polars y no Spark/Dask**: para un dataset de 13M filas (1.2 GB) un motor single-node columnar como Polars es la mejor opción — Spark/Dask agregarían overhead de coordinación distribuida sin necesidad. Polars usa Arrow como representación interna, vectorización SIMD y paralelización automática.
 
