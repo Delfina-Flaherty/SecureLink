@@ -212,12 +212,12 @@ Esta sección mapea cada paso del framework de diseño a la implementación conc
 |---|---|
 | 1. Objetivo del pipeline | Detectar fraude en transacciones y publicar métricas (tasa de fraude, monto en riesgo, FP/FN) en un dashboard analítico |
 | 2. Fuentes de datos | 3 archivos CSV (transacciones, usuarios, tarjetas) + 2 archivos JSON (labels de fraude, códigos MCC) |
-| 3. Estrategia de ingesta | Batch en chunks de 100 k filas (PyArrow incremental) — sin cargar todo en RAM |
-| 4. Procesamiento | Validación de esquema → limpieza ($, comas, fechas, duplicados) → features (debt/income, online vs swipe) → 4 reglas de detección |
+| 3. Estrategia de ingesta | Batch con Polars lazy/streaming (scan_csv + joins + sink_parquet) — sin cargar todo en RAM |
+| 4. Procesamiento | Validación de esquema → limpieza → indicadores derivados (debt/income, online vs swipe, distancia geográfica, frecuencia por tarjeta) → detección por puntaje ponderado |
 | 5. Almacenamiento del resultado | PostgreSQL DWH: tablas de detalle (`transactions_processed`) y agregadas (`fraud_metrics_global`, `fraud_by_mcc`, `fraud_by_state`, `fraud_by_card_type`, `fraud_by_merchant`, `user_profiles`). `COPY` para la tabla de detalle (5-10x más rápido que `INSERT`), `execute_values` para las agregadas. |
 | 6. Flujo de datos | DAG con validaciones paralelas + 4 cargas de referencia paralelas + 5 tareas secuenciales (`ingest_transactions` → `transform_data` → `compute_metrics` → `load_to_dwh` → `quality_check`). Retries con backoff exponencial. |
 | 7. Gobernanza y monitoreo | Validación de conexión a DWH antes de procesar, `quality_check` final (verifica montos negativos, registra ejecución en `pipeline_run_log`), logs detallados en Airflow UI |
-| 8. Capa de consumo | Streamlit con 3 paneles: General (KPIs y mapa de EEUU), Usuario (perfil individual), Comercios (top merchants) |
+| 8. Capa de consumo | Streamlit con 4 paneles: General (KPIs y mapa de EEUU), Usuario (perfil + mapa individual), Comercios (top merchants), Explorador con Filtros |
 
 ### 1) Objetivo del pipeline
 
@@ -247,14 +247,14 @@ Los datos de referencia chicos (users, cards, mcc, labels) se cargan una sola ve
 
 Las tres transformaciones (limpieza, features y reglas) se combinan en la tarea `transform_data` usando una sola pasada Polars sobre el parquet — antes eran 3 tareas separadas que leían y escribían el parquet completo cada una.
 
-- **Limpieza**: convierte fechas, limpia montos (`$`, comas), descarta negativos/inválidos, deduplica por `transaction_id`, normaliza booleanos.
-- **Features**: calcula `debt_income_ratio = total_debt / yearly_income` y clasifica `transaction_type` (Online vs Swipe).
-- **Reglas de detección**: aplica 4 reglas con un `OR` lógico:
-  1. Monto atípico (> percentil 99 — calculado en una pasada lazy adicional sobre el parquet)
-  2. Transacción con `errors` no nulo
-  3. Tarjeta presente en dark web (`card_on_dark_web == True`)
-  4. Endeudamiento alto (`debt_income_ratio > 3`)
-- Manejo de calidad: las filas inválidas (montos negativos, fechas inválidas, duplicados) se descartan en la fase de limpieza. El conteo aparece en el log.
+- **Limpieza**: convierte fechas, limpia montos (`$`, comas), descarta negativos/inválidos, normaliza booleanos.
+- **Indicadores derivados** (RF06):
+  - `debt_income_ratio = total_debt / yearly_income`
+  - `transaction_type` (Online vs Swipe) a partir de `use_chip`
+  - `distance_km`: distancia geográfica entre el domicilio del usuario (lat/long) y el comercio. Como el dataset no trae coordenadas del comercio, se aproxima al **centroide del estado** (`merchant_state`) y se calcula con la fórmula de **Haversine**. Las transacciones Online no tienen estado → `distance_km` queda en null (RF18).
+  - `card_txn_count`: frecuencia de transacciones por tarjeta.
+- **Detección por puntaje ponderado** (reemplazó al viejo OR de reglas): cada señal suma puntos según su poder predictivo y se marca `is_suspicious` si el `fraud_score` supera el umbral (4). Señales: online, monto en bandas, monto atípico para el usuario (p99 propio), error en la transacción, tarjeta en dark web, y **distancia geográfica inusual** (> 500 km, RF08). La columna `suspicion_reasons` indica qué señales dispararon.
+- Manejo de calidad: las filas inválidas (montos negativos, fechas inválidas) se descartan en la fase de limpieza. El conteo aparece en el log.
 
 > **Nota histórica**: en versiones anteriores estas eran 3 tareas separadas (`clean_data` → `build_features` → `apply_fraud_rules`) que cada una leía y escribía un parquet de ~1 GB. La fusión en `transform_data` ahorra 2 pasadas completas de I/O.
 
@@ -307,11 +307,12 @@ validate_files + validate_dwh                          (paralelo)
 
 Dashboard en **Streamlit** (`dashboard/app.py`), expuesto en `localhost:8501`. Consulta directamente las tablas agregadas del DWH vía SQLAlchemy + psycopg2 con queries parametrizadas (sin SQL injection).
 
-Tres paneles:
+Cuatro paneles:
 
-- **Panel General**: KPIs globales (tasa de fraude, monto en riesgo, FP/FN), fraude por MCC (top 15), choropleth de EEUU por estado, fraude por tipo de tarjeta.
-- **Panel de Usuario**: dado un `user_id`, muestra perfil demográfico, métricas agregadas y últimas 100 transacciones.
+- **Panel General**: KPIs globales (tasa de fraude, monto en riesgo, FP/FN, matriz de confusión), fraude por MCC, choropleth de EEUU por estado, fraude por tipo y marca de tarjeta, tendencias temporales.
+- **Panel de Usuario**: dado un `user_id`, muestra perfil demográfico, métricas agregadas, últimas 100 transacciones y un **mapa coroplético de sus transacciones por estado** (RF13).
 - **Panel de Comercios**: top N merchants por cantidad de fraude y por monto en riesgo.
+- **Explorador con Filtros** (RF16): filtros combinados por usuario, tarjeta, tipo de transacción, categoría MCC, estado, marca de tarjeta y rango de fechas. Muestra métricas del subconjunto filtrado y una tabla de detalle. Consulta `transactions_processed` con bind params (sin SQL injection).
 
 El refresh se hace en cada query (cache de 60 s vía `@st.cache_data(ttl=60)`).
 
@@ -327,9 +328,9 @@ El dataset es **histórico y estático** (1.2 GB). Streaming (Kafka/Flink) aport
 
 XCom serializa en la metadata de Airflow (PostgreSQL); está pensado para mensajes chicos (KB), no para 13 M filas (GB). Parquet en `/tmp` es columnar, comprimido y se lee/escribe con PyArrow en batches.
 
-### ¿Por qué 4 reglas en lugar de un modelo ML?
+### ¿Por qué puntaje ponderado en lugar de un modelo ML?
 
-Para esta entrega académica el alcance se limitó a **reglas explícitas**. La evolución previsible (sección del SRS) contempla entrenar un modelo con `train_fraud_labels.json` (que ya tenemos como ground truth) y reemplazar `apply_fraud_rules` por un `score_model` task.
+Para esta entrega académica el alcance se limitó a un **sistema de puntaje ponderado heurístico** (cada señal suma puntos según su poder predictivo observado en los datos; se marca sospechosa si supera un umbral). Reemplazó a una versión anterior que usaba un `OR` lógico de reglas, que tenía precisión muy baja (~0.4%) porque bastaba una sola señal débil para marcar. La evolución previsible (sección del SRS) contempla entrenar un modelo con `train_fraud_labels.json` (que ya tenemos como ground truth) y reemplazar el puntaje por un score probabilístico.
 
 ### Control de calidad
 
@@ -441,8 +442,9 @@ Y `gevent==23.9.1` agregado al `Dockerfile.airflow`.
 ┌─────────────────────────────────┐
 │       Streamlit Dashboard       │
 │  - Panel General                │
-│  - Panel de Usuario             │
+│  - Panel de Usuario (+ mapa)    │
 │  - Panel de Comercios           │
+│  - Explorador con Filtros       │
 └─────────────────────────────────┘
 ```
 
@@ -455,7 +457,7 @@ SecureLink/
 ├── dags/
 │   └── securelink_fraud_pipeline.py   # DAG de Airflow (8 tareas)
 ├── dashboard/
-│   └── app.py                          # Streamlit con 3 paneles
+│   └── app.py                          # Streamlit con 4 paneles
 ├── init_sql/
 │   └── init_dwh.sql                    # Schema del DWH (se ejecuta al primer arranque)
 ├── data/                               # Archivos CSV/JSON de entrada
@@ -731,10 +733,29 @@ SecureLink usa el mismo **esqueleto canónico** del ejemplo en tres dimensiones:
 
 ### Cumplimiento del SRS
 
-- **SRS sección 1 (objetivos)**: detección de fraude en transacciones financieras → implementado con las 4 reglas heurísticas
-- **SRS sección 2.b (interfaces de usuario)**: dashboard analítico → Streamlit con 4 paneles (General, Usuario, Comercios, Datasets)
-- **SRS sección 2.d (evolución previsible)**: detección en tiempo real, modelo ML, alertas → documentado el diseño en la sección [Evolución a tiempo real](#evolución-a-tiempo-real) (no implementado en el MVP)
-- **SRS sección 2.c (interfaces de hardware)**: cualquier PC con navegador web actualizado → cumplido (todo corre en Docker, único requisito es Docker Desktop)
+- **SRS sección 1 (objetivos)**: detección de fraude en transacciones financieras → implementado con el sistema de puntaje ponderado.
+- **SRS sección 2.b (interfaces de usuario)**: dashboard analítico → Streamlit con 5 vistas (General, Usuario, Comercios, Explorador con Filtros, Análisis de Datasets).
+- **SRS sección 2.d (evolución previsible)**: detección en tiempo real, modelo ML, alertas → documentado el diseño en la sección [Evolución a tiempo real](#evolución-a-tiempo-real) (no implementado en el MVP).
+- **SRS sección 2.c (interfaces de hardware)**: cualquier PC con navegador web actualizado → cumplido (todo corre en Docker, único requisito es Docker Desktop).
+
+**Requisitos funcionales (RF) — cobertura:**
+
+| RF | Estado | Dónde |
+|---|---|---|
+| RF01-RF05 (carga, validación, limpieza, joins) | ✅ | `validate_files`, `transform_data`, joins en `ingest_transactions` |
+| RF06 (indicadores derivados: ratio, frecuencia/tarjeta, distancia) | ✅ | `debt_income_ratio`, `card_txn_count`, `distance_km` (Haversine a centroide de estado) |
+| RF07 (labels como verdad) | ✅ | `is_fraud` desde `train_fraud_labels.json` |
+| RF08 (reglas: monto, error, distancia) | ✅ | Puntaje ponderado con señal de distancia inusual (>500 km) |
+| RF09 (tasa fraude, monto en riesgo, FP/FN) | ✅ | `fraud_metrics_global` + matriz de confusión |
+| RF10-RF11 (panel general) | ✅ | Panel General |
+| RF12-RF13 (panel usuario + mapa) | ✅ | Panel de Usuario con choropleth de transacciones |
+| RF14-RF15 (panel comercios) | ✅ | Panel de Comercios |
+| RF16 (filtros combinados) | ✅ | Panel "Explorador con Filtros" |
+| RF17 (mapa choropleth EEUU) | ✅ | Panel General |
+| RF18 (manejo de Online sin geo) | ✅ | `transaction_type`, distancia null en Online |
+| RF19-RF20 (errores claros, recarga de datos) | ✅ | Validaciones + re-ejecución del pipeline |
+
+> **Nota sobre RF06/RF08 (distancia geográfica)**: el dataset no incluye las coordenadas exactas del comercio (solo `merchant_state`). La distancia se aproxima usando el **centroide geográfico del estado** del comercio. Es una aproximación a nivel estado, documentada y suficiente para detectar transacciones lejanas al domicilio del usuario.
 
 ---
 
