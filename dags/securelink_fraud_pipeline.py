@@ -629,6 +629,12 @@ def _load_to_dwh(**context):
     for _tbl in ("fraud_by_mcc", "fraud_by_card_type", "fraud_by_state", "fraud_by_merchant"):
         cur.execute(f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS total_suspicious BIGINT DEFAULT 0")
         cur.execute(f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS amount_suspicious NUMERIC(18,2) DEFAULT 0")
+    # Columnas de la matriz de confusión en fraud_metrics_global (agregadas con la
+    # detección por puntaje ponderado). Sin esto, el INSERT a fraud_metrics_global
+    # falla con "column true_positives does not exist" en DWH creados con un
+    # init_dwh.sql anterior.
+    for _col in ("true_positives", "true_negatives", "false_positives", "false_negatives"):
+        cur.execute(f"ALTER TABLE fraud_metrics_global ADD COLUMN IF NOT EXISTS {_col} INTEGER")
 
     # ── transactions_processed: COPY directo a la tabla final ──
     # Optimizaciones:
@@ -670,7 +676,13 @@ def _load_to_dwh(**context):
     )
     logger.info(f"  CSV escrito → {COPY_CSV_PATH}. Ejecutando COPY...")
 
-    # COPY directo a la tabla final
+    # COPY directo a la tabla final.
+    # Nota: se probó la estrategia DROP índices → COPY → CREATE índices, pero
+    # resultó MÁS lenta en este dataset: el COPY bajó ~6 min, pero recrear los
+    # 6 índices sobre 12.6M filas costó ~14 min (varios son sobre columnas de
+    # texto). Net negativo. Se mantiene el COPY directo (los índices se mantienen
+    # durante la carga). El tuning de Postgres (shared_buffers=1GB en
+    # docker-compose) es lo que acelera esta fase de forma efectiva.
     cur.execute("TRUNCATE TABLE transactions_processed")
     with open(COPY_CSV_PATH, "r") as f:
         cur.copy_expert(
