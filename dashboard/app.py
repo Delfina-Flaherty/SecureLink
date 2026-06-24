@@ -42,13 +42,14 @@ def get_engine():
 
 @st.cache_data(ttl=300)
 def query(sql, params=None):
-    """Ejecuta una query con cache de 5 min. Usa bind params (`:nombre`) si se pasa params."""
     try:
         engine = get_engine()
         if params:
-            return pd.read_sql(text(sql), engine, params=params)
+            with engine.connect() as conn:
+                return pd.read_sql(text(sql), conn, params=params)
         return pd.read_sql(sql, engine)
-    except Exception:
+    except Exception as e:
+        st.error(f"Error en query: {e}")
         return None
 
 
@@ -1352,6 +1353,11 @@ elif pagina == "Explorador con Filtros":
     f_fechas = st.date_input(
         "Rango de fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax,
     )
+    # Normalizar: si devuelve un solo date (usuario no completó el rango), forzar tuple
+    if not isinstance(f_fechas, (tuple, list)):
+        f_fechas = (dmin, dmax)
+    elif len(f_fechas) == 1:
+        f_fechas = (f_fechas[0], dmax)
     solo_fraude = st.checkbox("Mostrar solo transacciones fraudulentas (is_fraud)")
     solo_sosp = st.checkbox("Mostrar solo sospechosas según las reglas (is_suspicious)")
 
@@ -1370,7 +1376,7 @@ elif pagina == "Explorador con Filtros":
     if f_marca != "(todas)":
         conds.append("card_brand = :marca"); params["marca"] = f_marca
     if isinstance(f_fechas, (tuple, list)) and len(f_fechas) == 2:
-        conds.append("transaction_date >= :d1 AND transaction_date < (:d2::date + 1)")
+        conds.append("transaction_date >= :d1 AND transaction_date < (CAST(:d2 AS DATE) + INTERVAL '1 day')")
         params["d1"] = str(f_fechas[0]); params["d2"] = str(f_fechas[1])
     if solo_fraude:
         conds.append("is_fraud = TRUE")
